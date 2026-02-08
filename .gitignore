@@ -1,0 +1,19 @@
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# streamlit
+.streamlit/
+
+# local data (DO NOT COMMIT)
+data/raw/
+data/snapshots/
+*.parquet
+*.csv
+
+# env
+.env
+.venv/
+condaenv/
+.ipynb_checkpoints/ 
