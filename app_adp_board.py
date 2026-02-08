@@ -3,7 +3,7 @@
 # Sleeper Dynasty ADP Board + Auction Price Board — CLICKABLE TILES (NO URL CHANGES)
 #
 # Key UX guarantees:
-# - Clicking a tile does NOT change URL, does NOT refresh filters, and does NOT recompute the board.
+# - Clicking a tile does NOT change URL, does NOT refresh filters, and does NOT recompute the board. 
 # - Board/pool recompute ONLY when filters change (filter_sig changes).
 # - Closing the dialog truly closes it; it will NOT re-open just because you change a filter.
 #
