@@ -17,3 +17,6 @@ data/snapshots/
 .venv/
 condaenv/
 .ipynb_checkpoints/ 
+
+sleeper_dynasty_adp/data/
+*.parquet
