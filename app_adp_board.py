@@ -3,7 +3,7 @@
 # Sleeper Dynasty ADP Board + Auction Price Board — CLICKABLE TILES (NO URL CHANGES)
 #
 # Key UX guarantees:
-# - Clicking a tile does NOT change URL, does NOT refresh filters, and does NOT recompute the board. 
+# - Clicking a tile does NOT change URL, does NOT refresh filters, and does NOT recompute the board.
 # - Board/pool recompute ONLY when filters change (filter_sig changes).
 # - Closing the dialog truly closes it; it will NOT re-open just because you change a filter.
 #
@@ -1202,7 +1202,7 @@ st.title("Sleeper Dynasty Board (ADP + Auction)")
 st.session_state.setdefault("selected_pid", None)
 st.session_state.setdefault("dialog_open", False)
 st.session_state.setdefault("filter_sig", None)
-st.session_state.setdefault("board_cache", {})  # dict[str, dict]
+st.session_state.setdefault("board_cache", {"sig": None, "cache": None})
 
 project_root_auto, raw_dir_auto, snapshots_dir_auto = pick_best_data_dir()
 
@@ -1354,10 +1354,18 @@ elif prev_sig != filter_sig:
 
 # ============================================================
 # ✅ FAST PATH: reuse computed board/pool if filter_sig unchanged
+#    (single-entry cache to prevent memory blow-up)
 # ============================================================
-cache = st.session_state["board_cache"].get(filter_sig)
+bc = st.session_state["board_cache"]
+
+cache = bc["cache"] if bc["sig"] == filter_sig else None
 
 if cache is None:
+
+    # --------------------------
+    # Recompute board + pool
+    # --------------------------
+
     drafts_f = filter_drafts(
         drafts=drafts,
         leagues=leagues,
@@ -1373,9 +1381,23 @@ if cache is None:
         te_premium_only=te_premium_only,
     )
 
-    months_in_scope = sorted([m for m in drafts_f.get("start_month", pd.Series([], dtype="string")).dropna().unique().tolist()])
+    months_in_scope = sorted(
+        [
+            m
+            for m in drafts_f.get(
+                "start_month",
+                pd.Series([], dtype="string")
+            )
+            .dropna()
+            .unique()
+            .tolist()
+        ]
+    )
+
     num_months_in_scope = len(months_in_scope)
-    required_player_drafts = int(min_drafts_per_month) * max(num_months_in_scope, 1)
+    required_player_drafts = int(min_drafts_per_month) * max(
+        num_months_in_scope, 1
+    )
 
     if len(drafts_f) == 0:
         st.warning("No drafts match your filters. Relax filters and try again.")
@@ -1387,7 +1409,9 @@ if cache is None:
     try:
         ppg_df = load_ppg(int(ppg_season))
     except Exception as e:
-        ppg_df = pd.DataFrame(columns=["player_id", "ppg", "games_played", "fantasy_pts"])
+        ppg_df = pd.DataFrame(
+            columns=["player_id", "ppg", "games_played", "fantasy_pts"]
+        )
         st.warning(f"Could not load PPG for {ppg_season}: {e}")
 
     mode = "auction" if board_kind.startswith("Auction") else "adp"
@@ -1396,22 +1420,40 @@ if cache is None:
     picks_for_pool = picks.copy()
     include_positions = ["QB", "RB", "WR", "TE"]
 
-    # Startup: optional rookie picks placeholders (ADP only)
-    if (mode == "adp") and board_kind.startswith("Startup") and startup_inclusion_mode == "Include rookie picks (K placeholders)":
+    # --------------------------
+    # Startup placeholders
+    # --------------------------
+    if (
+        mode == "adp"
+        and board_kind.startswith("Startup")
+        and startup_inclusion_mode == "Include rookie picks (K placeholders)"
+    ):
         rp_picks, rp_meta = build_rookie_pick_placeholders(
             picks=picks,
             drafts_filtered=drafts_f,
             players_df=players_df,
             early_rounds=int(kicker_placeholder_rounds),
         )
+
         if not rp_picks.empty:
-            common_cols = [c for c in picks_for_pool.columns if c in rp_picks.columns]
-            picks_for_pool = pd.concat([picks_for_pool, rp_picks[common_cols]], ignore_index=True)
+            common_cols = [
+                c for c in picks_for_pool.columns if c in rp_picks.columns
+            ]
+
+            picks_for_pool = pd.concat(
+                [picks_for_pool, rp_picks[common_cols]],
+                ignore_index=True,
+            )
+
             extra_meta = rp_meta.copy()
+
         include_positions = ["QB", "RB", "WR", "TE", "RDP"]
 
+    # --------------------------
     # Compute pool
+    # --------------------------
     if mode == "auction":
+
         pool = compute_player_auction_stats(
             picks=picks_for_pool,
             players_df=players_df,
@@ -1419,17 +1461,20 @@ if cache is None:
             ppg_df=ppg_df,
             include_positions=["QB", "RB", "WR", "TE"],
         )
+
         if pool.empty:
             st.warning(
                 "Auction board is empty.\n\n"
                 "Most common causes:\n"
-                "1) Your filtered drafts include no auction drafts\n"
-                "2) Your picks parquet does not include md_amount (auction price)\n"
-                "3) The selected date range excludes all auction drafts"
+                "1) No auction drafts in filters\n"
+                "2) picks missing md_amount\n"
+                "3) Date range excludes auctions"
             )
             close_player_dialog()
             st.stop()
+
     else:
+
         pool = compute_player_pick_stats(
             picks=picks_for_pool,
             players_df=players_df,
@@ -1440,49 +1485,114 @@ if cache is None:
         )
 
     pool = pool[pool["drafts"] >= required_player_drafts].copy()
+
     if pool.empty:
         st.warning(
-            "No entities meet the minimum drafts requirement for the selected date range.\n\n"
-            f"Try lowering 'Min drafts per month' (currently {min_drafts_per_month}) or widening the date range."
+            "No entities meet minimum draft requirements.\n"
+            "Try lowering Min drafts per month."
         )
         close_player_dialog()
         st.stop()
 
     pool_for_board = pool.copy()
 
-    # Rookie board = current-season rookies only (ADP only)
+    # --------------------------
+    # Rookie filtering
+    # --------------------------
     if mode == "adp" and board_kind.startswith("Rookie"):
-        pool_for_board = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=True)
+
+        pool_for_board = filter_rookies_by_season(
+            pool_for_board,
+            int(season),
+            keep_rookies=True,
+        )
+
         if pool_for_board.empty:
-            st.warning("No rookie-eligible players (current class) meet the minimum drafts requirement.")
+            st.warning("No rookie-eligible players.")
             close_player_dialog()
             st.stop()
 
-    # Startup: season-aware exclusion of rookies/rookie picks (ADP only)
     if mode == "adp" and board_kind.startswith("Startup"):
-        if startup_inclusion_mode == "Exclude rookies and rookie picks":
-            pool_for_board = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=False)
-            if "is_rookie_pick" in pool_for_board.columns:
-                pool_for_board = pool_for_board[~pool_for_board["is_rookie_pick"].astype(bool)].copy()
 
-    # ✅ Contiguous positional ranks AFTER final filters
+        if startup_inclusion_mode == "Exclude rookies and rookie picks":
+
+            pool_for_board = filter_rookies_by_season(
+                pool_for_board,
+                int(season),
+                keep_rookies=False,
+            )
+
+            if "is_rookie_pick" in pool_for_board.columns:
+                pool_for_board = pool_for_board[
+                    ~pool_for_board["is_rookie_pick"].astype(bool)
+                ].copy()
+
+    # --------------------------
+    # Positional ranks + mapping
+    # --------------------------
     pool_for_board["position"] = pool_for_board["position"].map(normalize_pos)
 
     if mode == "auction":
-        pool_for_board["avg_price"] = pd.to_numeric(pool_for_board["avg_price"], errors="coerce")
-        pool_for_board = pool_for_board.sort_values(["position", "avg_price"], ascending=[True, False]).reset_index(drop=True)
-        pool_for_board["pos_rank"] = pool_for_board.groupby("position").cumcount() + 1
-        mapping = build_board_map_snake_by_col(pool_for_board, int(num_teams), int(num_rounds), sort_col="avg_price", asc=False)
+
+        pool_for_board["avg_price"] = pd.to_numeric(
+            pool_for_board["avg_price"], errors="coerce"
+        )
+
+        pool_for_board = pool_for_board.sort_values(
+            ["position", "avg_price"],
+            ascending=[True, False],
+        ).reset_index(drop=True)
+
+        pool_for_board["pos_rank"] = (
+            pool_for_board.groupby("position").cumcount() + 1
+        )
+
+        mapping = build_board_map_snake_by_col(
+            pool_for_board,
+            int(num_teams),
+            int(num_rounds),
+            sort_col="avg_price",
+            asc=False,
+        )
+
     else:
-        pool_for_board["adp"] = pd.to_numeric(pool_for_board["adp"], errors="coerce")
-        pool_for_board = pool_for_board.sort_values(["position", "adp"], ascending=[True, True]).reset_index(drop=True)
-        pool_for_board["pos_rank"] = pool_for_board.groupby("position").cumcount() + 1
+
+        pool_for_board["adp"] = pd.to_numeric(
+            pool_for_board["adp"], errors="coerce"
+        )
+
+        pool_for_board = pool_for_board.sort_values(
+            ["position", "adp"],
+            ascending=[True, True],
+        ).reset_index(drop=True)
+
+        pool_for_board["pos_rank"] = (
+            pool_for_board.groupby("position").cumcount() + 1
+        )
 
         if board_kind.startswith("Startup"):
-            mapping = build_board_map_snake_by_col(pool_for_board, int(num_teams), int(num_rounds), sort_col="adp", asc=True)
-        else:
-            mapping = build_board_map_linear_by_col(pool_for_board, int(num_teams), int(num_rounds), sort_col="adp", asc=True)
 
+            mapping = build_board_map_snake_by_col(
+                pool_for_board,
+                int(num_teams),
+                int(num_rounds),
+                sort_col="adp",
+                asc=True,
+            )
+
+        else:
+
+            mapping = build_board_map_linear_by_col(
+                pool_for_board,
+                int(num_teams),
+                int(num_rounds),
+                sort_col="adp",
+                asc=True,
+            )
+
+    # --------------------------
+    # Save single cache entry
+    # --------------------------
     cache = {
         "mode": mode,
         "drafts_f": drafts_f,
@@ -1492,7 +1602,12 @@ if cache is None:
         "required_player_drafts": required_player_drafts,
         "num_months_in_scope": num_months_in_scope,
     }
-    st.session_state["board_cache"][filter_sig] = cache
+
+    st.session_state["board_cache"] = {
+        "sig": filter_sig,
+        "cache": cache,
+    }
+
 
 # Use cached artifacts (no recompute on tile click)
 mode = cache["mode"]
