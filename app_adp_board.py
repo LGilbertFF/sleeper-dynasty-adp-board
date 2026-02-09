@@ -36,11 +36,11 @@ import warnings
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-import matplotlib.pyplot as plt
 
 warnings.filterwarnings(
     "ignore",
@@ -55,7 +55,7 @@ POSITION_COLORS = {
     "RB": "#22c55e",
     "WR": "#3b82f6",
     "TE": "#f59e0b",
-    "K":  "#9ca3af",
+    "K": "#9ca3af",
     "RDP": "#ef4444",
     "UNK": "#64748b",
 }
@@ -221,13 +221,13 @@ def get_json(url: str, timeout: int = 30, retries: int = 4, backoff: float = 1.8
         try:
             r = session.get(url, timeout=timeout)
             if r.status_code == 429:
-                time.sleep(min(30, (backoff ** i) + 1))
+                time.sleep(min(30, (backoff**i) + 1))
                 continue
             r.raise_for_status()
             return r.json()
         except Exception as e:
             last_err = e
-            time.sleep(min(30, (backoff ** i) + 0.5))
+            time.sleep(min(30, (backoff**i) + 0.5))
     raise RuntimeError(f"GET failed: {url}\nLast error: {last_err}")
 
 
@@ -257,21 +257,19 @@ def normalize_pos(pos: Any) -> str:
         return "UNK"
     return p
 
-def safe_mul(a, b, *, clip=1e12):
-    """
-    Multiply two arrays/Series safely:
-      - coerces to float64
-      - handles inf/NaN
-      - clips magnitude to avoid overflow cascades
-    """
-    a = pd.to_numeric(a, errors="coerce").astype("float64")
-    b = pd.to_numeric(b, errors="coerce").astype("float64")
-    out = a * b
-    out = np.where(np.isfinite(out), out, np.nan)
-    out = np.clip(out, -clip, clip)
-    return pd.Series(out)
 
-def safe_series(x, *, fill=0.0, clip=1e12):
+def safe_mul(a, b, *, clip=1e12) -> pd.Series:
+    a = pd.to_numeric(a, errors="coerce").astype("float64")
+    bb = float(b) if np.isscalar(b) else pd.to_numeric(b, errors="coerce").astype("float64")
+    out = a * bb
+    out = pd.to_numeric(out, errors="coerce")
+    out = pd.Series(out).replace([np.inf, -np.inf], np.nan)
+    if clip is not None:
+        out = out.clip(-clip, clip)
+    return out
+
+
+def safe_series(x, *, fill=0.0, clip=1e12) -> pd.Series:
     s = pd.to_numeric(x, errors="coerce").astype("float64")
     s = s.replace([np.inf, -np.inf], np.nan).fillna(fill)
     if clip is not None:
@@ -292,17 +290,16 @@ def compute_filter_sig(**kwargs) -> str:
         if isinstance(v, (list, tuple, set)):
             return tuple(sorted([str(x) for x in v]))
         return str(v)
+
     items = [(k, norm(v)) for k, v in sorted(kwargs.items())]
     return "|".join([f"{k}={v}" for k, v in items])
 
 
 def format_pick_label_linear(round_no: int, team_no: int) -> str:
-    # Linear: team column equals pick-in-round
     return f"{int(round_no)}.{int(team_no):02d}"
 
 
 def format_pick_label_snake(round_no: int, team_no: int, num_teams: int) -> str:
-    # Snake: even rounds reverse the pick-in-round order
     if int(round_no) % 2 == 1:
         pick_in_round = int(team_no)
     else:
@@ -366,7 +363,7 @@ def add_time_columns(drafts: pd.DataFrame) -> pd.DataFrame:
         return df
 
     ms = pd.to_numeric(ts, errors="coerce")
-    lo = 946684800000   # 2000-01-01
+    lo = 946684800000  # 2000-01-01
     hi = 2051222400000  # 2035-01-01
     ms = ms.where((ms >= lo) & (ms <= hi))
 
@@ -453,41 +450,52 @@ def safe_col(df: pd.DataFrame, col: str) -> pd.Series:
 
 def calc_fantasy_points(df: pd.DataFrame, scoring: Dict[str, float]) -> pd.Series:
     """
-    Robust fantasy points calc:
-    - forces numeric float64
-    - converts bad strings -> NaN -> 0
-    - replaces inf/-inf -> 0
-    - clips extreme values to prevent overflow in multiply
+    Safe fantasy points:
+      - clips extreme raw values
+      - skips stats that overflow instead of crashing the whole app
+      - guarantees finite float output
     """
     pts = pd.Series(0.0, index=df.index, dtype="float64")
 
-    # tune this if you want; 1e9 is already "way too big" for fantasy stats
-    CLIP = 1e9
-
     for stat, w in scoring.items():
+        ww = float(w)
+
         try:
             x = safe_col(df, stat)
-        except Exception:
-            # if safe_col itself ever fails, treat as 0
+        except Exception as e:
+            st.warning(f"safe_col failed for stat={stat}: {e}")
             continue
 
-        # Force numeric float64 + sanitize
         x = pd.to_numeric(x, errors="coerce").astype("float64")
         x = x.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-        # Clip to avoid overflow during x*w
-        x = x.clip(-CLIP, CLIP)
+        # Raw Sleeper stats should never be huge; cap to avoid overflow cascades
+        x = x.clip(-1e6, 1e6)
 
-        ww = float(w)
+        try:
+            with np.errstate(over="raise", invalid="raise"):
+                add = x * ww
+        except FloatingPointError:
+            mx = float(np.nanmax(np.abs(x.values))) if len(x) else float("nan")
+            st.error(
+                "\n".join(
+                    [
+                        "Overflow in fantasy points calculation (stat skipped).",
+                        f"stat = {stat}",
+                        f"weight = {ww}",
+                        f"max|x| = {mx}",
+                        f"x.dtype = {x.dtype}",
+                        f"sample nonzero = {x[x != 0].head(10).to_list()}",
+                    ]
+                )
+            )
+            continue
 
-        # Multiply in float64; extra safety clip after multiply
-        add = x * ww
-        add = add.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        add = add.clip(-CLIP, CLIP)
+        add = pd.to_numeric(add, errors="coerce")
+        add = pd.Series(add, index=df.index).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
         pts = pts + add
 
-    # final cleanup
     pts = pts.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return pts
 
@@ -529,11 +537,19 @@ def load_ppg(season: int) -> pd.DataFrame:
     else:
         gp = pd.Series(np.nan, index=merged.index)
 
-    merged["games_played"] = gp.replace(0, np.nan)
-    merged["ppg"] = merged["fantasy_pts"] / merged["games_played"]
+    merged["games_played"] = pd.to_numeric(gp, errors="coerce").astype("float64")
+    merged["games_played"] = merged["games_played"].replace([np.inf, -np.inf], np.nan)
+
+    # Avoid divide-by-zero / inf cascades
+    den = merged["games_played"].where(merged["games_played"] > 0, np.nan)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        merged["ppg"] = merged["fantasy_pts"].astype("float64") / den
+
+    merged["ppg"] = pd.to_numeric(merged["ppg"], errors="coerce").replace([np.inf, -np.inf], np.nan)
 
     out = merged[["player_id", "ppg", "games_played", "fantasy_pts"]].copy()
-    out["ppg"] = pd.to_numeric(out["ppg"], errors="coerce")
+    for c in ["ppg", "games_played", "fantasy_pts"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
     return out
 
 
@@ -544,14 +560,17 @@ def infer_pick_no(picks: pd.DataFrame) -> pd.Series:
             if s.notna().any():
                 return s
 
-    # fallback: compute from round/draft_slot (assumes 12 teams unless st_teams in picks, which we don't have here)
+    # fallback: compute from round/draft_slot (assumes 12 teams if not present)
     if "round" in picks.columns and "draft_slot" in picks.columns:
-        r = pd.to_numeric(picks["round"], errors="coerce")
-        ds = pd.to_numeric(picks["draft_slot"], errors="coerce")
+        r = pd.to_numeric(picks["round"], errors="coerce").astype("float64")
+        ds = pd.to_numeric(picks["draft_slot"], errors="coerce").astype("float64")
 
-        # ensure float64 and avoid weird huge values / inf
-        r = r.astype("float64").replace([np.inf, -np.inf], np.nan)
-        ds = ds.astype("float64").replace([np.inf, -np.inf], np.nan)
+        r = r.replace([np.inf, -np.inf], np.nan)
+        ds = ds.replace([np.inf, -np.inf], np.nan)
+
+        # guardrails against corrupt data
+        r = r.where((r >= 1) & (r <= 80))
+        ds = ds.where((ds >= 1) & (ds <= 32))
 
         out = (r - 1.0) * 12.0 + ds
         out = out.replace([np.inf, -np.inf], np.nan)
@@ -615,7 +634,11 @@ def filter_drafts(
             df = df[df["start_dt"] <= date_max].copy()
 
     if te_premium_only and (not leagues.empty) and ("league_id" in df.columns) and ("league_id" in leagues.columns):
-        te_cols = [c for c in leagues.columns if c.endswith("scoring_settings.bonus_rec_te") or c == "scoring_settings.bonus_rec_te"]
+        te_cols = [
+            c
+            for c in leagues.columns
+            if c.endswith("scoring_settings.bonus_rec_te") or c == "scoring_settings.bonus_rec_te"
+        ]
         if te_cols:
             te_col = te_cols[0]
             lg = leagues[["league_id", te_col]].copy()
@@ -956,7 +979,7 @@ def player_monthly_trend_adp(
     picks: pd.DataFrame,
     drafts_filtered: pd.DataFrame,
     player_id: str,
-    last_n_months: int = 5
+    last_n_months: int = 5,
 ) -> pd.DataFrame:
     if "draft_id" not in picks.columns or "player_id" not in picks.columns:
         return pd.DataFrame(columns=["start_month", "adp", "picks"])
@@ -995,7 +1018,7 @@ def player_monthly_trend_price(
     picks: pd.DataFrame,
     drafts_filtered: pd.DataFrame,
     player_id: str,
-    last_n_months: int = 5
+    last_n_months: int = 5,
 ) -> pd.DataFrame:
     if "draft_id" not in picks.columns or "player_id" not in picks.columns or "md_amount" not in picks.columns:
         return pd.DataFrame(columns=["start_month", "avg_price", "sales"])
@@ -1163,7 +1186,6 @@ def show_player_dialog(
 
     st.divider()
 
-    # IMPORTANT: imperative close + rerun to actually dismiss the dialog
     if st.button("Close", type="primary", key="dlg_close_btn"):
         close_player_dialog()
         st.rerun()
@@ -1216,7 +1238,6 @@ def render_board_clickable_tiles(
                 else:
                     rank_label = POSITION_TEXT.get(pos, pos)
 
-                # Right pill: ADP boards show slot label (snake-aware); Auction shows $
                 if mode == "auction":
                     val = cell.get("avg_price", np.nan)
                     right_pill = f"${float(val):.0f}" if pd.notna(val) else (team if team else "—")
@@ -1264,7 +1285,6 @@ st.title("Sleeper Dynasty Board (ADP + Auction)")
 st.session_state.setdefault("selected_pid", None)
 st.session_state.setdefault("dialog_open", False)
 st.session_state.setdefault("filter_sig", None)
-st.session_state.setdefault("board_cache", {"sig": None, "cache": None})
 
 project_root_auto, raw_dir_auto, snapshots_dir_auto = pick_best_data_dir()
 
@@ -1301,7 +1321,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Startup-only options (kept; hidden for auction)
     if board_kind.startswith("Startup"):
         st.subheader("Startup rookies / rookie picks")
         startup_inclusion_mode = st.selectbox(
@@ -1327,7 +1346,6 @@ with st.sidebar:
         default=["complete"],
     )
 
-    # Draft type defaults depend on board
     if board_kind.startswith("Auction"):
         default_types = ["auction"]
     elif board_kind.startswith("Rookie"):
@@ -1358,7 +1376,6 @@ with st.sidebar:
     min_drafts_per_month = st.slider("Min drafts per month", 0, 50, 5, 1)
     ppg_season = st.number_input("PPG season", 2015, 2030, 2025, 1)
 
-
 # Load raw season
 try:
     drafts, picks, leagues = load_raw_season(raw_dir, int(season))
@@ -1387,7 +1404,7 @@ with c3:
 date_min = pd.Timestamp(datetime.combine(date_from, datetime.min.time()), tz="UTC")
 date_max = pd.Timestamp(datetime.combine(date_to, datetime.max.time()), tz="UTC")
 
-# Filter signature (drives cache + ensures dialog doesn’t pop open on filter changes)
+# Filter signature
 filter_sig = compute_filter_sig(
     season=season,
     board_kind=board_kind,
@@ -1415,44 +1432,31 @@ elif prev_sig != filter_sig:
     st.session_state["filter_sig"] = filter_sig
 
 # ============================================================
-# ✅ FAST PATH: reuse computed board/pool if filter_sig unchanged
-#    (single-entry cache to prevent memory blow-up)
+# ✅ SAFE CACHE (handles old/new formats, prevents KeyError)
 # ============================================================
-# ============================================================
-# ✅ SAFE CACHE (no KeyError, supports old/new state)
-# ============================================================
-st.session_state.setdefault("board_cache", {})
+if "board_cache" not in st.session_state or not isinstance(st.session_state["board_cache"], dict):
+    st.session_state["board_cache"] = {}
 
-# If an older version stored a dict like {"sig": ..., "cache": ...}, normalize it
 bc = st.session_state["board_cache"]
-if isinstance(bc, dict) and ("sig" in bc and "cache" in bc):
-    # Convert single-entry cache into the new multi-sig cache format
-    prev_sig = bc.get("sig")
-    prev_cache = bc.get("cache")
-    bc = {}
-    if prev_sig and prev_cache:
-        bc[str(prev_sig)] = prev_cache
-    st.session_state["board_cache"] = bc
 
-# Now we always treat board_cache as: dict[str, cache_obj]
-bc = st.session_state["board_cache"]
-cache = bc.get(filter_sig)
+# migrate legacy {"sig": ..., "cache": ...} to {"<sig>": cache_obj}
+if "sig" in bc and "cache" in bc and len(bc) <= 2:
+    prev_sig0 = bc.get("sig")
+    prev_cache0 = bc.get("cache")
+    st.session_state["board_cache"] = {}
+    bc = st.session_state["board_cache"]
+    if prev_sig0 and prev_cache0:
+        bc[str(prev_sig0)] = prev_cache0
 
-# Optional: prune cache so it doesn't grow forever (prevents memory blow-ups on Streamlit Cloud)
+cache = bc.get(str(filter_sig))
+
 MAX_CACHE_ENTRIES = 6
-if isinstance(bc, dict) and len(bc) > MAX_CACHE_ENTRIES:
-    # keep newest keys by insertion order (Python 3.7+ preserves dict insertion order)
+if len(bc) > MAX_CACHE_ENTRIES:
     keys = list(bc.keys())
     for k in keys[:-MAX_CACHE_ENTRIES]:
         bc.pop(k, None)
 
-
 if cache is None:
-
-    # --------------------------
-    # Recompute board + pool
-    # --------------------------
-
     drafts_f = filter_drafts(
         drafts=drafts,
         leagues=leagues,
@@ -1471,20 +1475,12 @@ if cache is None:
     months_in_scope = sorted(
         [
             m
-            for m in drafts_f.get(
-                "start_month",
-                pd.Series([], dtype="string")
-            )
-            .dropna()
-            .unique()
-            .tolist()
+            for m in drafts_f.get("start_month", pd.Series([], dtype="string")).dropna().unique().tolist()
         ]
     )
 
     num_months_in_scope = len(months_in_scope)
-    required_player_drafts = int(min_drafts_per_month) * max(
-        num_months_in_scope, 1
-    )
+    required_player_drafts = int(min_drafts_per_month) * max(num_months_in_scope, 1)
 
     if len(drafts_f) == 0:
         st.warning("No drafts match your filters. Relax filters and try again.")
@@ -1496,9 +1492,7 @@ if cache is None:
     try:
         ppg_df = load_ppg(int(ppg_season))
     except Exception as e:
-        ppg_df = pd.DataFrame(
-            columns=["player_id", "ppg", "games_played", "fantasy_pts"]
-        )
+        ppg_df = pd.DataFrame(columns=["player_id", "ppg", "games_played", "fantasy_pts"])
         st.warning(f"Could not load PPG for {ppg_season}: {e}")
 
     mode = "auction" if board_kind.startswith("Auction") else "adp"
@@ -1507,9 +1501,6 @@ if cache is None:
     picks_for_pool = picks.copy()
     include_positions = ["QB", "RB", "WR", "TE"]
 
-    # --------------------------
-    # Startup placeholders
-    # --------------------------
     if (
         mode == "adp"
         and board_kind.startswith("Startup")
@@ -1523,24 +1514,13 @@ if cache is None:
         )
 
         if not rp_picks.empty:
-            common_cols = [
-                c for c in picks_for_pool.columns if c in rp_picks.columns
-            ]
-
-            picks_for_pool = pd.concat(
-                [picks_for_pool, rp_picks[common_cols]],
-                ignore_index=True,
-            )
-
+            common_cols = [c for c in picks_for_pool.columns if c in rp_picks.columns]
+            picks_for_pool = pd.concat([picks_for_pool, rp_picks[common_cols]], ignore_index=True)
             extra_meta = rp_meta.copy()
 
         include_positions = ["QB", "RB", "WR", "TE", "RDP"]
 
-    # --------------------------
-    # Compute pool
-    # --------------------------
     if mode == "auction":
-
         pool = compute_player_auction_stats(
             picks=picks_for_pool,
             players_df=players_df,
@@ -1548,7 +1528,6 @@ if cache is None:
             ppg_df=ppg_df,
             include_positions=["QB", "RB", "WR", "TE"],
         )
-
         if pool.empty:
             st.warning(
                 "Auction board is empty.\n\n"
@@ -1559,9 +1538,7 @@ if cache is None:
             )
             close_player_dialog()
             st.stop()
-
     else:
-
         pool = compute_player_pick_stats(
             picks=picks_for_pool,
             players_df=players_df,
@@ -1574,65 +1551,32 @@ if cache is None:
     pool = pool[pool["drafts"] >= required_player_drafts].copy()
 
     if pool.empty:
-        st.warning(
-            "No entities meet minimum draft requirements.\n"
-            "Try lowering Min drafts per month."
-        )
+        st.warning("No entities meet minimum draft requirements.\nTry lowering Min drafts per month.")
         close_player_dialog()
         st.stop()
 
     pool_for_board = pool.copy()
 
-    # --------------------------
-    # Rookie filtering
-    # --------------------------
     if mode == "adp" and board_kind.startswith("Rookie"):
-
-        pool_for_board = filter_rookies_by_season(
-            pool_for_board,
-            int(season),
-            keep_rookies=True,
-        )
-
+        pool_for_board = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=True)
         if pool_for_board.empty:
             st.warning("No rookie-eligible players.")
             close_player_dialog()
             st.stop()
 
     if mode == "adp" and board_kind.startswith("Startup"):
-
         if startup_inclusion_mode == "Exclude rookies and rookie picks":
-
-            pool_for_board = filter_rookies_by_season(
-                pool_for_board,
-                int(season),
-                keep_rookies=False,
-            )
-
+            pool_for_board = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=False)
             if "is_rookie_pick" in pool_for_board.columns:
-                pool_for_board = pool_for_board[
-                    ~pool_for_board["is_rookie_pick"].astype(bool)
-                ].copy()
+                pool_for_board = pool_for_board[~pool_for_board["is_rookie_pick"].astype(bool)].copy()
 
-    # --------------------------
-    # Positional ranks + mapping
-    # --------------------------
     pool_for_board["position"] = pool_for_board["position"].map(normalize_pos)
 
     if mode == "auction":
+        pool_for_board["avg_price"] = pd.to_numeric(pool_for_board["avg_price"], errors="coerce")
 
-        pool_for_board["avg_price"] = pd.to_numeric(
-            pool_for_board["avg_price"], errors="coerce"
-        )
-
-        pool_for_board = pool_for_board.sort_values(
-            ["position", "avg_price"],
-            ascending=[True, False],
-        ).reset_index(drop=True)
-
-        pool_for_board["pos_rank"] = (
-            pool_for_board.groupby("position").cumcount() + 1
-        )
+        pool_for_board = pool_for_board.sort_values(["position", "avg_price"], ascending=[True, False]).reset_index(drop=True)
+        pool_for_board["pos_rank"] = pool_for_board.groupby("position").cumcount() + 1
 
         mapping = build_board_map_snake_by_col(
             pool_for_board,
@@ -1641,24 +1585,13 @@ if cache is None:
             sort_col="avg_price",
             asc=False,
         )
-
     else:
+        pool_for_board["adp"] = pd.to_numeric(pool_for_board["adp"], errors="coerce")
 
-        pool_for_board["adp"] = pd.to_numeric(
-            pool_for_board["adp"], errors="coerce"
-        )
-
-        pool_for_board = pool_for_board.sort_values(
-            ["position", "adp"],
-            ascending=[True, True],
-        ).reset_index(drop=True)
-
-        pool_for_board["pos_rank"] = (
-            pool_for_board.groupby("position").cumcount() + 1
-        )
+        pool_for_board = pool_for_board.sort_values(["position", "adp"], ascending=[True, True]).reset_index(drop=True)
+        pool_for_board["pos_rank"] = pool_for_board.groupby("position").cumcount() + 1
 
         if board_kind.startswith("Startup"):
-
             mapping = build_board_map_snake_by_col(
                 pool_for_board,
                 int(num_teams),
@@ -1666,9 +1599,7 @@ if cache is None:
                 sort_col="adp",
                 asc=True,
             )
-
         else:
-
             mapping = build_board_map_linear_by_col(
                 pool_for_board,
                 int(num_teams),
@@ -1677,9 +1608,6 @@ if cache is None:
                 asc=True,
             )
 
-    # --------------------------
-    # Save single cache entry
-    # --------------------------
     cache = {
         "mode": mode,
         "drafts_f": drafts_f,
@@ -1689,10 +1617,7 @@ if cache is None:
         "required_player_drafts": required_player_drafts,
         "num_months_in_scope": num_months_in_scope,
     }
-
-    st.session_state["board_cache"][filter_sig] = cache
-
-
+    st.session_state["board_cache"][str(filter_sig)] = cache
 
 # Use cached artifacts (no recompute on tile click)
 mode = cache["mode"]
@@ -1717,7 +1642,6 @@ else:
     st.subheader("ADP Board")
     title_line = f"{board_kind} • Season {season} • {num_teams} teams × {num_rounds} rounds • ranked by ADP"
 
-# Startup + Auction are snake; Rookie is linear
 is_snake_board = bool(board_kind.startswith("Startup") or board_kind.startswith("Auction"))
 
 render_board_clickable_tiles(
