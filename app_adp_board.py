@@ -28,6 +28,11 @@
 # Player dialog graphs:
 # - ADP boards: pick distribution (overall pick) + monthly ADP trend
 # - Auction board: price distribution ($) + monthly avg price trend
+#
+# IMPORTANT PERF/CRASH FIX (OOM):
+# - Do NOT cache/store full picks DataFrame per filter signature.
+# - Cache only lightweight board objects and draft_id/month metadata.
+# - Load pick rows on-demand for a single player when dialog opens.
 # ============================================================
 
 import os
@@ -973,36 +978,100 @@ def build_board_map_linear_by_col(
 
 
 # ----------------------------
-# Trends
+# On-demand pick loading (dialog only)
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def load_picks_for_player(raw_dir: str, season: int, player_id: str, draft_ids: List[str]) -> pd.DataFrame:
+    """
+    Load ONLY the pick rows for one player and the filtered draft_ids.
+    Uses pyarrow.dataset filter pushdown when available; falls back to pandas read.
+    """
+    _drafts_path, picks_path, _leagues_path = season_raw_paths(raw_dir, season)
+    if not os.path.exists(picks_path):
+        return pd.DataFrame()
+
+    pid = str(player_id)
+    dids = [str(x) for x in draft_ids]
+    if len(dids) == 0:
+        return pd.DataFrame()
+
+    # columns we might need in dialog:
+    want_cols = [
+        "draft_id",
+        "player_id",
+        "pick_no",
+        "overall_pick",
+        "pick",
+        "draft_pick",
+        "pick_number",
+        "round",
+        "draft_slot",
+        "md_amount",
+    ]
+
+    # Prefer pyarrow dataset filtering (avoids loading entire file)
+    try:
+        import pyarrow.dataset as ds
+        import pyarrow.compute as pc
+
+        dataset = ds.dataset(picks_path, format="parquet")
+        schema_names = set(dataset.schema.names)
+        use_cols = [c for c in want_cols if c in schema_names]
+
+        # Filters:
+        # player_id == pid AND draft_id IN dids
+        expr = (ds.field("player_id") == pid) & pc.is_in(ds.field("draft_id"), value_set=dids)
+
+        table = dataset.to_table(columns=use_cols, filter=expr)
+        df = table.to_pandas()
+    except Exception:
+        # Fallback: load with pandas then filter in-memory (still safer than caching it)
+        df = pd.read_parquet(picks_path)
+        for c in ["draft_id", "player_id"]:
+            if c in df.columns:
+                df[c] = df[c].astype(str)
+        df = df[(df.get("player_id", "") == pid) & (df.get("draft_id", "").isin(set(dids)))].copy()
+        use_cols = [c for c in want_cols if c in df.columns]
+        df = df[use_cols].copy()
+
+    # ensure str types
+    if "draft_id" in df.columns:
+        df["draft_id"] = df["draft_id"].astype(str)
+    if "player_id" in df.columns:
+        df["player_id"] = df["player_id"].astype(str)
+    return df
+
+
+# ----------------------------
+# Trends (operate on already-filtered picks + small drafts_trend)
 # ----------------------------
 def player_monthly_trend_adp(
-    picks: pd.DataFrame,
-    drafts_filtered: pd.DataFrame,
+    picks_player: pd.DataFrame,
+    drafts_trend: pd.DataFrame,
     player_id: str,
     last_n_months: int = 5,
 ) -> pd.DataFrame:
-    if "draft_id" not in picks.columns or "player_id" not in picks.columns:
+    if picks_player is None or picks_player.empty:
         return pd.DataFrame(columns=["start_month", "adp", "picks"])
 
-    d = drafts_filtered[["draft_id", "start_month"]].copy()
+    d = drafts_trend[["draft_id", "start_month"]].copy()
     d["draft_id"] = d["draft_id"].astype(str)
 
-    p = picks.copy()
-    p["draft_id"] = p["draft_id"].astype(str)
-    p["player_id"] = p["player_id"].astype(str)
+    p = picks_player.copy()
+    if "draft_id" not in p.columns:
+        return pd.DataFrame(columns=["start_month", "adp", "picks"])
 
-    p = p[p["player_id"] == str(player_id)].copy()
+    p["draft_id"] = p["draft_id"].astype(str)
     p = p.merge(d, on="draft_id", how="inner")
 
     p["pick_no_calc"] = infer_pick_no(p)
     p["pick_no_calc"] = pd.to_numeric(p["pick_no_calc"], errors="coerce")
-    p = p[p["pick_no_calc"].notna()].copy()
-    p = p[p["start_month"].notna()].copy()
+    p = p[p["pick_no_calc"].notna() & p["start_month"].notna()].copy()
 
-    months = sorted([m for m in p["start_month"].unique() if m and m != "nan"])
-    if not months:
+    months = sorted(p["start_month"].astype(str).unique().tolist())
+    keep = months[-last_n_months:] if months else []
+    if not keep:
         return pd.DataFrame(columns=["start_month", "adp", "picks"])
-    keep = months[-last_n_months:]
 
     agg = (
         p[p["start_month"].isin(keep)]
@@ -1010,37 +1079,38 @@ def player_monthly_trend_adp(
         .agg(adp=("pick_no_calc", "mean"), picks=("pick_no_calc", "size"))
     )
     agg["adp"] = pd.to_numeric(agg["adp"], errors="coerce").round(2)
-    agg = agg.sort_values("start_month")
-    return agg
+    return agg.sort_values("start_month")
 
 
 def player_monthly_trend_price(
-    picks: pd.DataFrame,
-    drafts_filtered: pd.DataFrame,
+    picks_player: pd.DataFrame,
+    drafts_trend: pd.DataFrame,
     player_id: str,
     last_n_months: int = 5,
 ) -> pd.DataFrame:
-    if "draft_id" not in picks.columns or "player_id" not in picks.columns or "md_amount" not in picks.columns:
+    if picks_player is None or picks_player.empty:
         return pd.DataFrame(columns=["start_month", "avg_price", "sales"])
 
-    d = drafts_filtered[["draft_id", "start_month"]].copy()
+    d = drafts_trend[["draft_id", "start_month"]].copy()
     d["draft_id"] = d["draft_id"].astype(str)
 
-    p = picks.copy()
-    p["draft_id"] = p["draft_id"].astype(str)
-    p["player_id"] = p["player_id"].astype(str)
+    p = picks_player.copy()
+    if "draft_id" not in p.columns:
+        return pd.DataFrame(columns=["start_month", "avg_price", "sales"])
 
-    p = p[p["player_id"] == str(player_id)].copy()
+    p["draft_id"] = p["draft_id"].astype(str)
     p = p.merge(d, on="draft_id", how="inner")
 
-    p["amount"] = pd.to_numeric(p["md_amount"], errors="coerce")
-    p = p[p["amount"].notna()].copy()
-    p = p[p["start_month"].notna()].copy()
-
-    months = sorted([m for m in p["start_month"].unique() if m and m != "nan"])
-    if not months:
+    if "md_amount" not in p.columns:
         return pd.DataFrame(columns=["start_month", "avg_price", "sales"])
-    keep = months[-last_n_months:]
+
+    p["amount"] = pd.to_numeric(p["md_amount"], errors="coerce")
+    p = p[p["amount"].notna() & p["start_month"].notna()].copy()
+
+    months = sorted(p["start_month"].astype(str).unique().tolist())
+    keep = months[-last_n_months:] if months else []
+    if not keep:
+        return pd.DataFrame(columns=["start_month", "avg_price", "sales"])
 
     agg = (
         p[p["start_month"].isin(keep)]
@@ -1048,8 +1118,7 @@ def player_monthly_trend_price(
         .agg(avg_price=("amount", "mean"), sales=("amount", "size"))
     )
     agg["avg_price"] = pd.to_numeric(agg["avg_price"], errors="coerce").round(2)
-    agg = agg.sort_values("start_month")
-    return agg
+    return agg.sort_values("start_month")
 
 
 # ----------------------------
@@ -1376,7 +1445,7 @@ with st.sidebar:
     min_drafts_per_month = st.slider("Min drafts per month", 0, 50, 5, 1)
     ppg_season = st.number_input("PPG season", 2015, 2030, 2025, 1)
 
-# Load raw season
+# Load raw season (we still load picks here, but we do NOT store them in session cache)
 try:
     drafts, picks, leagues = load_raw_season(raw_dir, int(season))
 except Exception as e:
@@ -1432,7 +1501,7 @@ elif prev_sig != filter_sig:
     st.session_state["filter_sig"] = filter_sig
 
 # ============================================================
-# ✅ SAFE CACHE (handles old/new formats, prevents KeyError)
+# ✅ SAFE CACHE (lightweight only, prevents OOM across year flips)
 # ============================================================
 if "board_cache" not in st.session_state or not isinstance(st.session_state["board_cache"], dict):
     st.session_state["board_cache"] = {}
@@ -1450,7 +1519,8 @@ if "sig" in bc and "cache" in bc and len(bc) <= 2:
 
 cache = bc.get(str(filter_sig))
 
-MAX_CACHE_ENTRIES = 6
+# Keep cache small — this is the main "year flip crash" fix.
+MAX_CACHE_ENTRIES = 2
 if len(bc) > MAX_CACHE_ENTRIES:
     keys = list(bc.keys())
     for k in keys[:-MAX_CACHE_ENTRIES]:
@@ -1478,7 +1548,6 @@ if cache is None:
             for m in drafts_f.get("start_month", pd.Series([], dtype="string")).dropna().unique().tolist()
         ]
     )
-
     num_months_in_scope = len(months_in_scope)
     required_player_drafts = int(min_drafts_per_month) * max(num_months_in_scope, 1)
 
@@ -1498,7 +1567,7 @@ if cache is None:
     mode = "auction" if board_kind.startswith("Auction") else "adp"
 
     extra_meta = pd.DataFrame()
-    picks_for_pool = picks.copy()
+    picks_for_pool = picks  # local variable only (NOT cached)
     include_positions = ["QB", "RB", "WR", "TE"]
 
     if (
@@ -1574,8 +1643,10 @@ if cache is None:
 
     if mode == "auction":
         pool_for_board["avg_price"] = pd.to_numeric(pool_for_board["avg_price"], errors="coerce")
-
-        pool_for_board = pool_for_board.sort_values(["position", "avg_price"], ascending=[True, False]).reset_index(drop=True)
+        pool_for_board = (
+            pool_for_board.sort_values(["position", "avg_price"], ascending=[True, False])
+            .reset_index(drop=True)
+        )
         pool_for_board["pos_rank"] = pool_for_board.groupby("position").cumcount() + 1
 
         mapping = build_board_map_snake_by_col(
@@ -1587,8 +1658,10 @@ if cache is None:
         )
     else:
         pool_for_board["adp"] = pd.to_numeric(pool_for_board["adp"], errors="coerce")
-
-        pool_for_board = pool_for_board.sort_values(["position", "adp"], ascending=[True, True]).reset_index(drop=True)
+        pool_for_board = (
+            pool_for_board.sort_values(["position", "adp"], ascending=[True, True])
+            .reset_index(drop=True)
+        )
         pool_for_board["pos_rank"] = pool_for_board.groupby("position").cumcount() + 1
 
         if board_kind.startswith("Startup"):
@@ -1608,29 +1681,54 @@ if cache is None:
                 asc=True,
             )
 
+    # Small drafts trend table (only two cols)
+    drafts_trend = drafts_f[["draft_id", "start_month"]].copy()
+    drafts_trend["draft_id"] = drafts_trend["draft_id"].astype(str)
+
+    # Light pool for selection + dialog header (keep only needed cols)
+    LIGHT_COLS_ADP = [
+        "player_id", "full_name", "team", "position", "pos_rank",
+        "adp", "min_pick", "max_pick", "drafts", "picks",
+        "ppg", "games_played", "fantasy_pts",
+        "is_rookie_pick",
+    ]
+    LIGHT_COLS_AUC = [
+        "player_id", "full_name", "team", "position", "pos_rank",
+        "avg_price", "med_price", "min_price", "max_price",
+        "drafts", "sales",
+        "ppg", "games_played", "fantasy_pts",
+    ]
+    light_cols = LIGHT_COLS_AUC if mode == "auction" else LIGHT_COLS_ADP
+    light_cols = [c for c in light_cols if c in pool_for_board.columns]
+    pool_light = pool_for_board[light_cols].copy()
+
     cache = {
         "mode": mode,
-        "drafts_f": drafts_f,
-        "picks_for_pool": picks_for_pool,
-        "pool_for_board": pool_for_board,
         "mapping": mapping,
-        "required_player_drafts": required_player_drafts,
-        "num_months_in_scope": num_months_in_scope,
+        "pool_light": pool_light,
+        "drafts_trend": drafts_trend,
+        "draft_ids": drafts_trend["draft_id"].astype(str).tolist(),
+        "draft_count": int(len(drafts_f)),
+        "required_player_drafts": int(required_player_drafts),
+        "num_months_in_scope": int(num_months_in_scope),
+        "raw_dir": raw_dir,
+        "season": int(season),
     }
     st.session_state["board_cache"][str(filter_sig)] = cache
 
 # Use cached artifacts (no recompute on tile click)
 mode = cache["mode"]
-drafts_f = cache["drafts_f"]
-picks_for_pool = cache["picks_for_pool"]
-pool_for_board = cache["pool_for_board"]
 mapping = cache["mapping"]
+pool_for_board = cache["pool_light"]
+drafts_trend = cache["drafts_trend"]
+draft_ids = cache["draft_ids"]
+draft_count = cache["draft_count"]
 required_player_drafts = cache["required_player_drafts"]
 num_months_in_scope = cache["num_months_in_scope"]
 
 # Summary metrics
 m1, m2, m3 = st.columns(3)
-m1.metric("Drafts", f"{len(drafts_f):,}")
+m1.metric("Drafts", f"{draft_count:,}")
 m2.metric("Months in date range", f"{num_months_in_scope:,}")
 m3.metric("Min drafts per entity", f"{required_player_drafts:,}")
 
@@ -1653,7 +1751,7 @@ render_board_clickable_tiles(
     is_snake_board=is_snake_board,
 )
 
-# Dialog (only computes tiny subsets + trend; does not rebuild board)
+# Dialog (loads only the selected player's pick rows on demand)
 pid = st.session_state.get("selected_pid", None)
 if pid and st.session_state.get("dialog_open", False):
     sel = pool_for_board[pool_for_board["player_id"].astype(str) == str(pid)].head(1)
@@ -1663,15 +1761,10 @@ if pid and st.session_state.get("dialog_open", False):
     else:
         sel_row = sel.iloc[0]
 
-        if mode == "auction":
-            p_sub = picks_for_pool.copy()
-            p_sub["draft_id"] = p_sub["draft_id"].astype(str)
-            p_sub["player_id"] = p_sub["player_id"].astype(str)
-            p_sub = p_sub[
-                (p_sub["player_id"] == str(pid))
-                & (p_sub["draft_id"].isin(set(drafts_f["draft_id"].astype(str))))
-            ].copy()
+        # Load only this player's pick rows for the current filtered draft set
+        p_sub = load_picks_for_player(raw_dir, int(season), str(pid), draft_ids)
 
+        if mode == "auction":
             if "md_amount" in p_sub.columns:
                 p_sub["amount"] = pd.to_numeric(p_sub["md_amount"], errors="coerce")
                 p_sub = p_sub[p_sub["amount"].notna()].copy()
@@ -1679,23 +1772,15 @@ if pid and st.session_state.get("dialog_open", False):
                 p_sub = p_sub.iloc[0:0].copy()
                 p_sub["amount"] = np.nan
 
-            trend = player_monthly_trend_price(picks_for_pool, drafts_f, str(pid), last_n_months=5)
+            trend = player_monthly_trend_price(p_sub, drafts_trend, str(pid), last_n_months=5)
             show_player_dialog("auction", sel_row, int(ppg_season), p_sub, trend)
 
         else:
-            p_sub = picks_for_pool.copy()
-            p_sub["draft_id"] = p_sub["draft_id"].astype(str)
-            p_sub["player_id"] = p_sub["player_id"].astype(str)
-            p_sub = p_sub[
-                (p_sub["player_id"] == str(pid))
-                & (p_sub["draft_id"].isin(set(drafts_f["draft_id"].astype(str))))
-            ].copy()
-
             p_sub["pick_no_calc"] = infer_pick_no(p_sub)
             p_sub["pick_no_calc"] = pd.to_numeric(p_sub["pick_no_calc"], errors="coerce")
             p_sub = p_sub[p_sub["pick_no_calc"].notna()].copy()
 
-            trend = player_monthly_trend_adp(picks_for_pool, drafts_f, str(pid), last_n_months=5)
+            trend = player_monthly_trend_adp(p_sub, drafts_trend, str(pid), last_n_months=5)
             show_player_dialog("adp", sel_row, int(ppg_season), p_sub, trend)
 
 st.caption("Tip: drafts missing start_dt are excluded by date filters (invalid start_time).")
