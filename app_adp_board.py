@@ -1356,9 +1356,34 @@ elif prev_sig != filter_sig:
 # ✅ FAST PATH: reuse computed board/pool if filter_sig unchanged
 #    (single-entry cache to prevent memory blow-up)
 # ============================================================
-bc = st.session_state["board_cache"]
+# ============================================================
+# ✅ SAFE CACHE (no KeyError, supports old/new state)
+# ============================================================
+st.session_state.setdefault("board_cache", {})
 
-cache = bc["cache"] if bc["sig"] == filter_sig else None
+# If an older version stored a dict like {"sig": ..., "cache": ...}, normalize it
+bc = st.session_state["board_cache"]
+if isinstance(bc, dict) and ("sig" in bc and "cache" in bc):
+    # Convert single-entry cache into the new multi-sig cache format
+    prev_sig = bc.get("sig")
+    prev_cache = bc.get("cache")
+    bc = {}
+    if prev_sig and prev_cache:
+        bc[str(prev_sig)] = prev_cache
+    st.session_state["board_cache"] = bc
+
+# Now we always treat board_cache as: dict[str, cache_obj]
+bc = st.session_state["board_cache"]
+cache = bc.get(filter_sig)
+
+# Optional: prune cache so it doesn't grow forever (prevents memory blow-ups on Streamlit Cloud)
+MAX_CACHE_ENTRIES = 6
+if isinstance(bc, dict) and len(bc) > MAX_CACHE_ENTRIES:
+    # keep newest keys by insertion order (Python 3.7+ preserves dict insertion order)
+    keys = list(bc.keys())
+    for k in keys[:-MAX_CACHE_ENTRIES]:
+        bc.pop(k, None)
+
 
 if cache is None:
 
@@ -1603,10 +1628,8 @@ if cache is None:
         "num_months_in_scope": num_months_in_scope,
     }
 
-    st.session_state["board_cache"] = {
-        "sig": filter_sig,
-        "cache": cache,
-    }
+    st.session_state["board_cache"][filter_sig] = cache
+
 
 
 # Use cached artifacts (no recompute on tile click)
