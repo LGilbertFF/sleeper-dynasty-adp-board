@@ -2,37 +2,22 @@
 # ============================================================
 # Sleeper Dynasty ADP Board + Auction Price Board — CLICKABLE TILES (NO URL CHANGES)
 #
-# Key UX guarantees:
-# - Clicking a tile does NOT change URL, does NOT refresh filters, and does NOT recompute the board.
-# - Board/pool recompute ONLY when filters change (filter_sig changes).
-# - Closing the dialog truly closes it; it will NOT re-open just because you change a filter.
+# DEBUG BUILD:
+# - Adds detailed debug printouts (st.write / st.code / st.exception)
+# - Measures timing + memory usage (best-effort) to catch "too much data" crashes
+# - Adds guardrails for board_cache (stores LIGHT objects only by default)
+# - Adds a toggle to disable caching big DataFrames in session_state
+# - Makes dialogs version-safe (st.dialog / st.experimental_dialog / inline fallback)
 #
-# Boards supported:
-# 1) Startup ADP (snake)
-# 2) Rookie ADP (linear)
-# 3) Auction Price (snake)
-#
-# Auction notes:
-# - Uses picks.md_amount (from Sleeper auction picks metadata.amount) as price
-# - Aggregates by player_id over filtered auction drafts:
-#     avg_price, median, min, max, sales, drafts
-# - Positional ranks are contiguous AFTER final filters, ranked by:
-#     ADP boards: adp ascending (lower is earlier)
-#     Auction board: avg_price descending (higher is earlier/left)
-#
-# Tile right pill:
-# - ADP boards: shows slot pick label (1.01, 2.05, 10.11, etc.) based on board slot
-#              Startup = snake-wrapped; Rookie = linear
-# - Auction board: shows avg auction value ($)
-#
-# Player dialog graphs:
-# - ADP boards: pick distribution (overall pick) + monthly ADP trend
-# - Auction board: price distribution ($) + monthly avg price trend
+# If the app hard-crashes (OOM / SIGKILL) and you don't get a traceback:
+# - Enable "Light cache only" + "Disable dialog" and try the same season changes.
+# - Watch the "DEBUG: memory + sizes" section for what explodes.
 # ============================================================
 
 import os
 import time
 import warnings
+import traceback
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -49,6 +34,76 @@ warnings.filterwarnings(
 )
 
 st.set_page_config(page_title="Sleeper ADP / Auction Board", layout="wide")
+
+# -----------------------------
+# DEBUG UTILITIES
+# -----------------------------
+def _now() -> float:
+    return time.perf_counter()
+
+def _fmt_secs(s: float) -> str:
+    return f"{s:.3f}s"
+
+def _safe_mb(nbytes: Optional[int]) -> str:
+    if nbytes is None:
+        return "n/a"
+    return f"{nbytes/1024/1024:,.2f} MB"
+
+def _df_mem_mb(df: Optional[pd.DataFrame]) -> float:
+    try:
+        if df is None:
+            return 0.0
+        return float(df.memory_usage(deep=True).sum() / 1024 / 1024)
+    except Exception:
+        return 0.0
+
+def _get_rss_mb() -> Optional[float]:
+    """Best-effort resident set size in MB (Linux)."""
+    try:
+        import resource  # stdlib
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # On Linux ru_maxrss is KB; on macOS it's bytes. Streamlit cloud is Linux.
+        return float(rss_kb / 1024.0)
+    except Exception:
+        return None
+
+def _dbg_header(title: str):
+    st.markdown(f"### 🧪 DEBUG: {title}")
+
+def _dbg_kv(k: str, v: Any):
+    st.write({k: v})
+
+def _dbg_df_info(name: str, df: pd.DataFrame, head: int = 3):
+    st.markdown(f"**{name}**: shape={df.shape}, mem≈{_df_mem_mb(df):,.2f} MB")
+    st.write("columns:", list(df.columns))
+    st.dataframe(df.head(head), use_container_width=True)
+
+def _dbg_exception(context: str, e: Exception):
+    st.error(f"❌ Exception in {context}: {type(e).__name__}: {e}")
+    st.code(traceback.format_exc())
+    st.exception(e)
+
+# -----------------------------
+# Streamlit dialog compatibility
+# -----------------------------
+_DIALOG_FN = getattr(st, "dialog", None) or getattr(st, "experimental_dialog", None)
+
+def dialog_decorator(title: str):
+    """
+    Version-safe dialog decorator.
+    Uses st.dialog if present; else st.experimental_dialog; else no-op.
+    Avoids width= kwarg (not supported in some versions).
+    """
+    if _DIALOG_FN is None:
+        def _noop(fn):
+            return fn
+        return _noop
+    try:
+        return _DIALOG_FN(title)
+    except TypeError:
+        def _noop(fn):
+            return fn
+        return _noop
 
 POSITION_COLORS = {
     "QB": "#a855f7",
@@ -258,25 +313,6 @@ def normalize_pos(pos: Any) -> str:
     return p
 
 
-def safe_mul(a, b, *, clip=1e12) -> pd.Series:
-    a = pd.to_numeric(a, errors="coerce").astype("float64")
-    bb = float(b) if np.isscalar(b) else pd.to_numeric(b, errors="coerce").astype("float64")
-    out = a * bb
-    out = pd.to_numeric(out, errors="coerce")
-    out = pd.Series(out).replace([np.inf, -np.inf], np.nan)
-    if clip is not None:
-        out = out.clip(-clip, clip)
-    return out
-
-
-def safe_series(x, *, fill=0.0, clip=1e12) -> pd.Series:
-    s = pd.to_numeric(x, errors="coerce").astype("float64")
-    s = s.replace([np.inf, -np.inf], np.nan).fillna(fill)
-    if clip is not None:
-        s = s.clip(-clip, clip)
-    return s
-
-
 def safe_str(x: Any) -> str:
     if x is None:
         return ""
@@ -450,45 +486,19 @@ def safe_col(df: pd.DataFrame, col: str) -> pd.Series:
 
 def calc_fantasy_points(df: pd.DataFrame, scoring: Dict[str, float]) -> pd.Series:
     pts = pd.Series(0.0, index=df.index, dtype="float64")
-
     for stat, w in scoring.items():
         ww = float(w)
-
         try:
             x = safe_col(df, stat)
-        except Exception as e:
-            st.warning(f"safe_col failed for stat={stat}: {e}")
-            continue
-
-        x = pd.to_numeric(x, errors="coerce").astype("float64")
-        x = x.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        x = x.clip(-1e6, 1e6)
-
-        try:
-            with np.errstate(over="raise", invalid="raise"):
-                add = x * ww
-        except FloatingPointError:
-            mx = float(np.nanmax(np.abs(x.values))) if len(x) else float("nan")
-            st.error(
-                "\n".join(
-                    [
-                        "Overflow in fantasy points calculation (stat skipped).",
-                        f"stat = {stat}",
-                        f"weight = {ww}",
-                        f"max|x| = {mx}",
-                        f"x.dtype = {x.dtype}",
-                        f"sample nonzero = {x[x != 0].head(10).to_list()}",
-                    ]
-                )
-            )
-            continue
-
-        add = pd.to_numeric(add, errors="coerce")
-        add = pd.Series(add, index=df.index).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        pts = pts + add
-
-    pts = pts.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return pts
+            x = pd.to_numeric(x, errors="coerce").astype("float64")
+            x = x.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-1e6, 1e6)
+            add = x * ww
+            add = pd.Series(add, index=df.index).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            pts = pts + add
+        except Exception:
+            # do not crash, but keep a breadcrumb
+            st.warning(f"PPG: failed stat={stat}")
+    return pts.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 
 @st.cache_data(show_spinner=False)
@@ -530,11 +540,8 @@ def load_ppg(season: int) -> pd.DataFrame:
 
     merged["games_played"] = pd.to_numeric(gp, errors="coerce").astype("float64")
     merged["games_played"] = merged["games_played"].replace([np.inf, -np.inf], np.nan)
-
     den = merged["games_played"].where(merged["games_played"] > 0, np.nan)
-    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-        merged["ppg"] = merged["fantasy_pts"].astype("float64") / den
-
+    merged["ppg"] = pd.to_numeric(merged["fantasy_pts"], errors="coerce") / den
     merged["ppg"] = pd.to_numeric(merged["ppg"], errors="coerce").replace([np.inf, -np.inf], np.nan)
 
     out = merged[["player_id", "ppg", "games_played", "fantasy_pts"]].copy()
@@ -549,21 +556,13 @@ def infer_pick_no(picks: pd.DataFrame) -> pd.Series:
             s = pd.to_numeric(picks[c], errors="coerce")
             if s.notna().any():
                 return s
-
     if "round" in picks.columns and "draft_slot" in picks.columns:
         r = pd.to_numeric(picks["round"], errors="coerce").astype("float64")
         ds = pd.to_numeric(picks["draft_slot"], errors="coerce").astype("float64")
-
-        r = r.replace([np.inf, -np.inf], np.nan)
-        ds = ds.replace([np.inf, -np.inf], np.nan)
-
-        r = r.where((r >= 1) & (r <= 80))
-        ds = ds.where((ds >= 1) & (ds <= 32))
-
+        r = r.replace([np.inf, -np.inf], np.nan).where((r >= 1) & (r <= 80))
+        ds = ds.replace([np.inf, -np.inf], np.nan).where((ds >= 1) & (ds <= 32))
         out = (r - 1.0) * 12.0 + ds
-        out = out.replace([np.inf, -np.inf], np.nan)
-        return out
-
+        return out.replace([np.inf, -np.inf], np.nan)
     return pd.Series(np.nan, index=picks.index)
 
 
@@ -622,11 +621,7 @@ def filter_drafts(
             df = df[df["start_dt"] <= date_max].copy()
 
     if te_premium_only and (not leagues.empty) and ("league_id" in df.columns) and ("league_id" in leagues.columns):
-        te_cols = [
-            c
-            for c in leagues.columns
-            if c.endswith("scoring_settings.bonus_rec_te") or c == "scoring_settings.bonus_rec_te"
-        ]
+        te_cols = [c for c in leagues.columns if c.endswith("scoring_settings.bonus_rec_te") or c == "scoring_settings.bonus_rec_te"]
         if te_cols:
             te_col = te_cols[0]
             lg = leagues[["league_id", te_col]].copy()
@@ -651,6 +646,7 @@ def is_rookie_for_season_row(row: pd.Series, season: int) -> bool:
 def filter_rookies_by_season(df: pd.DataFrame, season: int, keep_rookies: bool) -> pd.DataFrame:
     if df.empty:
         return df
+    # apply() can be expensive; keep but instrument
     mask = df.apply(lambda r: is_rookie_for_season_row(r, season), axis=1)
     return df[mask].copy() if keep_rookies else df[~mask].copy()
 
@@ -969,37 +965,39 @@ def player_monthly_trend_adp(
     player_id: str,
     last_n_months: int = 5,
 ) -> pd.DataFrame:
-    if "draft_id" not in picks.columns or "player_id" not in picks.columns:
+    try:
+        if "draft_id" not in picks.columns or "player_id" not in picks.columns:
+            return pd.DataFrame(columns=["start_month", "adp", "picks"])
+
+        d = drafts_filtered[["draft_id", "start_month"]].copy()
+        d["draft_id"] = d["draft_id"].astype(str)
+
+        p = picks.copy()
+        p["draft_id"] = p["draft_id"].astype(str)
+        p["player_id"] = p["player_id"].astype(str)
+
+        p = p[p["player_id"] == str(player_id)].copy()
+        p = p.merge(d, on="draft_id", how="inner")
+
+        p["pick_no_calc"] = infer_pick_no(p)
+        p["pick_no_calc"] = pd.to_numeric(p["pick_no_calc"], errors="coerce")
+        p = p[p["pick_no_calc"].notna()].copy()
+        p = p[p["start_month"].notna()].copy()
+
+        months = sorted([m for m in p["start_month"].unique() if m and m != "nan"])
+        if not months:
+            return pd.DataFrame(columns=["start_month", "adp", "picks"])
+        keep = months[-last_n_months:]
+
+        agg = (
+            p[p["start_month"].isin(keep)]
+            .groupby("start_month", as_index=False)
+            .agg(adp=("pick_no_calc", "mean"), picks=("pick_no_calc", "size"))
+        )
+        agg["adp"] = pd.to_numeric(agg["adp"], errors="coerce").round(2)
+        return agg.sort_values("start_month")
+    except Exception:
         return pd.DataFrame(columns=["start_month", "adp", "picks"])
-
-    d = drafts_filtered[["draft_id", "start_month"]].copy()
-    d["draft_id"] = d["draft_id"].astype(str)
-
-    p = picks.copy()
-    p["draft_id"] = p["draft_id"].astype(str)
-    p["player_id"] = p["player_id"].astype(str)
-
-    p = p[p["player_id"] == str(player_id)].copy()
-    p = p.merge(d, on="draft_id", how="inner")
-
-    p["pick_no_calc"] = infer_pick_no(p)
-    p["pick_no_calc"] = pd.to_numeric(p["pick_no_calc"], errors="coerce")
-    p = p[p["pick_no_calc"].notna()].copy()
-    p = p[p["start_month"].notna()].copy()
-
-    months = sorted([m for m in p["start_month"].unique() if m and m != "nan"])
-    if not months:
-        return pd.DataFrame(columns=["start_month", "adp", "picks"])
-    keep = months[-last_n_months:]
-
-    agg = (
-        p[p["start_month"].isin(keep)]
-        .groupby("start_month", as_index=False)
-        .agg(adp=("pick_no_calc", "mean"), picks=("pick_no_calc", "size"))
-    )
-    agg["adp"] = pd.to_numeric(agg["adp"], errors="coerce").round(2)
-    agg = agg.sort_values("start_month")
-    return agg
 
 
 def player_monthly_trend_price(
@@ -1008,36 +1006,38 @@ def player_monthly_trend_price(
     player_id: str,
     last_n_months: int = 5,
 ) -> pd.DataFrame:
-    if "draft_id" not in picks.columns or "player_id" not in picks.columns or "md_amount" not in picks.columns:
+    try:
+        if "draft_id" not in picks.columns or "player_id" not in picks.columns or "md_amount" not in picks.columns:
+            return pd.DataFrame(columns=["start_month", "avg_price", "sales"])
+
+        d = drafts_filtered[["draft_id", "start_month"]].copy()
+        d["draft_id"] = d["draft_id"].astype(str)
+
+        p = picks.copy()
+        p["draft_id"] = p["draft_id"].astype(str)
+        p["player_id"] = p["player_id"].astype(str)
+
+        p = p[p["player_id"] == str(player_id)].copy()
+        p = p.merge(d, on="draft_id", how="inner")
+
+        p["amount"] = pd.to_numeric(p["md_amount"], errors="coerce")
+        p = p[p["amount"].notna()].copy()
+        p = p[p["start_month"].notna()].copy()
+
+        months = sorted([m for m in p["start_month"].unique() if m and m != "nan"])
+        if not months:
+            return pd.DataFrame(columns=["start_month", "avg_price", "sales"])
+        keep = months[-last_n_months:]
+
+        agg = (
+            p[p["start_month"].isin(keep)]
+            .groupby("start_month", as_index=False)
+            .agg(avg_price=("amount", "mean"), sales=("amount", "size"))
+        )
+        agg["avg_price"] = pd.to_numeric(agg["avg_price"], errors="coerce").round(2)
+        return agg.sort_values("start_month")
+    except Exception:
         return pd.DataFrame(columns=["start_month", "avg_price", "sales"])
-
-    d = drafts_filtered[["draft_id", "start_month"]].copy()
-    d["draft_id"] = d["draft_id"].astype(str)
-
-    p = picks.copy()
-    p["draft_id"] = p["draft_id"].astype(str)
-    p["player_id"] = p["player_id"].astype(str)
-
-    p = p[p["player_id"] == str(player_id)].copy()
-    p = p.merge(d, on="draft_id", how="inner")
-
-    p["amount"] = pd.to_numeric(p["md_amount"], errors="coerce")
-    p = p[p["amount"].notna()].copy()
-    p = p[p["start_month"].notna()].copy()
-
-    months = sorted([m for m in p["start_month"].unique() if m and m != "nan"])
-    if not months:
-        return pd.DataFrame(columns=["start_month", "avg_price", "sales"])
-    keep = months[-last_n_months:]
-
-    agg = (
-        p[p["start_month"].isin(keep)]
-        .groupby("start_month", as_index=False)
-        .agg(avg_price=("amount", "mean"), sales=("amount", "size"))
-    )
-    agg["avg_price"] = pd.to_numeric(agg["avg_price"], errors="coerce").round(2)
-    agg = agg.sort_values("start_month")
-    return agg
 
 
 # ----------------------------
@@ -1053,7 +1053,7 @@ def close_player_dialog() -> None:
     st.session_state["selected_pid"] = None
 
 
-@st.dialog("Player Quick View", width="large")
+@dialog_decorator("Player Quick View")
 def show_player_dialog(
     mode: str,
     sel_row: pd.Series,
@@ -1061,126 +1061,140 @@ def show_player_dialog(
     picks_subset: pd.DataFrame,
     trend: pd.DataFrame,
 ) -> None:
-    sel_name = safe_str(sel_row.get("full_name", "Unknown"))
-    sel_team = safe_str(sel_row.get("team", ""))
-    sel_pos = normalize_pos(sel_row.get("position", "UNK"))
-    sel_pid = safe_str(sel_row.get("player_id", ""))
+    # Wrap ALL dialog rendering so we get a traceback instead of a crash
+    try:
+        sel_name = safe_str(sel_row.get("full_name", "Unknown"))
+        sel_team = safe_str(sel_row.get("team", ""))
+        sel_pos = normalize_pos(sel_row.get("position", "UNK"))
+        sel_pid = safe_str(sel_row.get("player_id", ""))
 
-    sel_is_rp = bool(sel_row.get("is_rookie_pick", False)) or sel_pos == "RDP" or sel_pid.startswith("ROOKIE_PICK_")
+        sel_is_rp = bool(sel_row.get("is_rookie_pick", False)) or sel_pos == "RDP" or sel_pid.startswith("ROOKIE_PICK_")
 
-    top = st.columns([1.15, 2.85], gap="large")
-    with top[0]:
-        if not sel_is_rp and sel_pid:
-            st.image(sleeper_headshot_url(sel_pid), width=190)
-        else:
-            st.markdown("### 🔴")
-            st.caption("Rookie pick placeholder")
-
-    with top[1]:
-        st.markdown(f"### {sel_name}")
-        st.caption(f"{sel_team} • {POSITION_TEXT.get(sel_pos, sel_pos)}")
-
-        pos_rank_val = sel_row.get("pos_rank", np.nan)
-        drafts_val = sel_row.get("drafts", np.nan)
-        ppg_val = sel_row.get("ppg", np.nan)
-
-        if mode == "auction":
-            avg_price = sel_row.get("avg_price", np.nan)
-            med_price = sel_row.get("med_price", np.nan)
-            min_price = sel_row.get("min_price", np.nan)
-            max_price = sel_row.get("max_price", np.nan)
-            sales = sel_row.get("sales", np.nan)
-
-            r1 = st.columns(4)
-            r1[0].metric("Avg $", f"{float(avg_price):.2f}" if pd.notna(avg_price) else "—")
-            r1[1].metric("Median $", f"{float(med_price):.2f}" if pd.notna(med_price) else "—")
-            r1[2].metric("Sales", f"{int(sales):,}" if pd.notna(sales) else "—")
-            r1[3].metric("Pos Rank", f"{int(pos_rank_val):,}" if pd.notna(pos_rank_val) else "—")
-
-            r2 = st.columns(3)
-            r2[0].metric("Min $", f"{float(min_price):.0f}" if pd.notna(min_price) else "—")
-            r2[1].metric("Max $", f"{float(max_price):.0f}" if pd.notna(max_price) else "—")
-            r2[2].metric(f"PPG ({ppg_season})", f"{float(ppg_val):.2f}" if pd.notna(ppg_val) else "—")
-
-            r3 = st.columns(2)
-            r3[0].metric("Drafts", f"{int(drafts_val):,}" if pd.notna(drafts_val) else "—")
-            r3[1].metric("Team", sel_team if sel_team else "—")
-
-        else:
-            adp_val = sel_row.get("adp", np.nan)
-            min_pick_val = sel_row.get("min_pick", np.nan)
-            max_pick_val = sel_row.get("max_pick", np.nan)
-
-            r1 = st.columns(4)
-            r1[0].metric("ADP", f"{float(adp_val):.2f}" if pd.notna(adp_val) else "—")
-            r1[1].metric(f"PPG ({ppg_season})", f"{float(ppg_val):.2f}" if pd.notna(ppg_val) else "—")
-            r1[2].metric("Drafts", f"{int(drafts_val):,}" if pd.notna(drafts_val) else "—")
-            r1[3].metric("Pos Rank", f"{int(pos_rank_val):,}" if pd.notna(pos_rank_val) else "—")
-
-            r2 = st.columns(2)
-            r2[0].metric("Min Pick", f"{float(min_pick_val):.0f}" if pd.notna(min_pick_val) else "—")
-            r2[1].metric("Max Pick", f"{float(max_pick_val):.0f}" if pd.notna(max_pick_val) else "—")
-
-    st.divider()
-
-    g1, g2 = st.columns([1.2, 1.3], gap="large")
-
-    with g1:
-        if mode == "auction":
-            st.markdown("#### Auction price distribution")
-            if picks_subset is None or len(picks_subset) == 0:
-                st.info("No auction purchases found for this player in the filtered draft set.")
+        top = st.columns([1.15, 2.85], gap="large")
+        with top[0]:
+            if not sel_is_rp and sel_pid:
+                st.image(sleeper_headshot_url(sel_pid), width=190)
             else:
-                fig, ax = plt.subplots()
-                ax.hist(picks_subset["amount"].values, bins=30)
-                ax.set_xlabel("Auction price ($)")
-                ax.set_ylabel("Count")
-                st.pyplot(fig, clear_figure=True)
-                plt.close(fig)
-        else:
-            st.markdown("#### Draft position distribution")
-            if picks_subset is None or len(picks_subset) == 0:
-                st.info("No pick rows found for this entity in the filtered draft set.")
-            else:
-                fig, ax = plt.subplots()
-                ax.hist(picks_subset["pick_no_calc"].values, bins=30)
-                ax.set_xlabel("Overall pick")
-                ax.set_ylabel("Count")
-                st.pyplot(fig, clear_figure=True)
-                plt.close(fig)
+                st.markdown("### 🔴")
+                st.caption("Rookie pick placeholder")
 
-    with g2:
-        if mode == "auction":
-            st.markdown("#### Avg auction price trend by month (last 5 months present)")
-            if trend is None or trend.empty:
-                st.info("No monthly price trend available.")
-            else:
-                fig2, ax2 = plt.subplots()
-                ax2.plot(trend["start_month"].astype(str), trend["avg_price"].astype(float), marker="o")
-                ax2.set_xlabel("Draft month")
-                ax2.set_ylabel("Avg price ($)")
-                st.pyplot(fig2, clear_figure=True)
-                plt.close(fig2)
-                st.dataframe(trend, use_container_width=True, height=180)
-        else:
-            st.markdown("#### ADP trend by month (last 5 months present)")
-            if trend is None or trend.empty:
-                st.info("No monthly ADP trend available.")
-            else:
-                fig2, ax2 = plt.subplots()
-                ax2.plot(trend["start_month"].astype(str), trend["adp"].astype(float), marker="o")
-                ax2.invert_yaxis()
-                ax2.set_xlabel("Draft month")
-                ax2.set_ylabel("ADP (lower is earlier)")
-                st.pyplot(fig2, clear_figure=True)
-                plt.close(fig2)
-                st.dataframe(trend, use_container_width=True, height=180)
+        with top[1]:
+            st.markdown(f"### {sel_name}")
+            st.caption(f"{sel_team} • {POSITION_TEXT.get(sel_pos, sel_pos)}")
 
-    st.divider()
+            pos_rank_val = sel_row.get("pos_rank", np.nan)
+            drafts_val = sel_row.get("drafts", np.nan)
+            ppg_val = sel_row.get("ppg", np.nan)
 
-    if st.button("Close", type="primary", key="dlg_close_btn"):
-        close_player_dialog()
-        st.rerun()
+            if mode == "auction":
+                avg_price = sel_row.get("avg_price", np.nan)
+                med_price = sel_row.get("med_price", np.nan)
+                min_price = sel_row.get("min_price", np.nan)
+                max_price = sel_row.get("max_price", np.nan)
+                sales = sel_row.get("sales", np.nan)
+
+                r1 = st.columns(4)
+                r1[0].metric("Avg $", f"{float(avg_price):.2f}" if pd.notna(avg_price) else "—")
+                r1[1].metric("Median $", f"{float(med_price):.2f}" if pd.notna(med_price) else "—")
+                r1[2].metric("Sales", f"{int(sales):,}" if pd.notna(sales) else "—")
+                r1[3].metric("Pos Rank", f"{int(pos_rank_val):,}" if pd.notna(pos_rank_val) else "—")
+
+                r2 = st.columns(3)
+                r2[0].metric("Min $", f"{float(min_price):.0f}" if pd.notna(min_price) else "—")
+                r2[1].metric("Max $", f"{float(max_price):.0f}" if pd.notna(max_price) else "—")
+                r2[2].metric(f"PPG ({ppg_season})", f"{float(ppg_val):.2f}" if pd.notna(ppg_val) else "—")
+
+                r3 = st.columns(2)
+                r3[0].metric("Drafts", f"{int(drafts_val):,}" if pd.notna(drafts_val) else "—")
+                r3[1].metric("Team", sel_team if sel_team else "—")
+
+            else:
+                adp_val = sel_row.get("adp", np.nan)
+                min_pick_val = sel_row.get("min_pick", np.nan)
+                max_pick_val = sel_row.get("max_pick", np.nan)
+
+                r1 = st.columns(4)
+                r1[0].metric("ADP", f"{float(adp_val):.2f}" if pd.notna(adp_val) else "—")
+                r1[1].metric(f"PPG ({ppg_season})", f"{float(ppg_val):.2f}" if pd.notna(ppg_val) else "—")
+                r1[2].metric("Drafts", f"{int(drafts_val):,}" if pd.notna(drafts_val) else "—")
+                r1[3].metric("Pos Rank", f"{int(pos_rank_val):,}" if pd.notna(pos_rank_val) else "—")
+
+                r2 = st.columns(2)
+                r2[0].metric("Min Pick", f"{float(min_pick_val):.0f}" if pd.notna(min_pick_val) else "—")
+                r2[1].metric("Max Pick", f"{float(max_pick_val):.0f}" if pd.notna(max_pick_val) else "—")
+
+        st.divider()
+
+        g1, g2 = st.columns([1.2, 1.3], gap="large")
+
+        with g1:
+            if mode == "auction":
+                st.markdown("#### Auction price distribution")
+                if picks_subset is None or len(picks_subset) == 0:
+                    st.info("No auction purchases found for this player in the filtered draft set.")
+                else:
+                    fig = plt.figure()
+                    plt.hist(picks_subset["amount"].values, bins=30)
+                    plt.xlabel("Auction price ($)")
+                    plt.ylabel("Count")
+                    st.pyplot(fig, clear_figure=True)
+            else:
+                st.markdown("#### Draft position distribution")
+                if picks_subset is None or len(picks_subset) == 0:
+                    st.info("No pick rows found for this entity in the filtered draft set.")
+                else:
+                    fig = plt.figure()
+                    plt.hist(picks_subset["pick_no_calc"].values, bins=30)
+                    plt.xlabel("Overall pick")
+                    plt.ylabel("Count")
+                    st.pyplot(fig, clear_figure=True)
+
+        with g2:
+            if mode == "auction":
+                st.markdown("#### Avg auction price trend by month (last 5 months present)")
+                if trend is None or trend.empty:
+                    st.info("No monthly price trend available.")
+                else:
+                    fig2 = plt.figure()
+                    plt.plot(trend["start_month"].astype(str), trend["avg_price"].astype(float), marker="o")
+                    plt.xlabel("Draft month")
+                    plt.ylabel("Avg price ($)")
+                    st.pyplot(fig2, clear_figure=True)
+                    st.dataframe(trend, use_container_width=True, height=180)
+            else:
+                st.markdown("#### ADP trend by month (last 5 months present)")
+                if trend is None or trend.empty:
+                    st.info("No monthly ADP trend available.")
+                else:
+                    fig2 = plt.figure()
+                    plt.plot(trend["start_month"].astype(str), trend["adp"].astype(float), marker="o")
+                    plt.gca().invert_yaxis()
+                    plt.xlabel("Draft month")
+                    plt.ylabel("ADP (lower is earlier)")
+                    st.pyplot(fig2, clear_figure=True)
+                    st.dataframe(trend, use_container_width=True, height=180)
+
+        st.divider()
+        if st.button("Close", type="primary", key="dlg_close_btn"):
+            close_player_dialog()
+            st.rerun()
+
+    except Exception as e:
+        _dbg_exception("show_player_dialog", e)
+        if st.button("Close (after error)", type="primary", key="dlg_close_btn_err"):
+            close_player_dialog()
+            st.rerun()
+
+
+def render_player_panel_inline(
+    mode: str,
+    sel_row: pd.Series,
+    ppg_season: int,
+    picks_subset: pd.DataFrame,
+    trend: pd.DataFrame,
+) -> None:
+    st.subheader("Player Quick View (Inline Fallback)")
+    show_player_dialog(mode, sel_row, ppg_season, picks_subset, trend)
 
 
 def render_board_clickable_tiles(
@@ -1283,6 +1297,21 @@ project_root_auto, raw_dir_auto, snapshots_dir_auto = pick_best_data_dir()
 with st.sidebar:
     st.header("Options Menu")
 
+    st.subheader("Diagnostics")
+    DEBUG = st.checkbox("Enable debug panels", value=True)
+    LIGHT_CACHE_ONLY = st.checkbox(
+        "Light cache only (avoid storing big DataFrames in session_state)",
+        value=True,
+        help="If crashes are OOM-related, this often fixes it. We still recompute on filter change.",
+    )
+    DISABLE_DIALOG = st.checkbox(
+        "Disable dialog (always inline)",
+        value=False,
+        help="If your Streamlit build is unstable with dialogs, use this.",
+    )
+    st.caption(f"Streamlit version: {st.__version__}")
+
+    st.divider()
     st.subheader("Data / Paths")
     st.caption(f"Auto project root:\n{project_root_auto}")
     raw_dir = st.text_input(
@@ -1368,13 +1397,17 @@ with st.sidebar:
     min_drafts_per_month = st.slider("Min drafts per month", 0, 50, 5, 1)
     ppg_season = st.number_input("PPG season", 2015, 2030, 2025, 1)
 
-# Load raw season
+# -----------------------------
+# Load raw season with debug
+# -----------------------------
+t0 = _now()
 try:
     drafts, picks, leagues = load_raw_season(raw_dir, int(season))
 except Exception as e:
-    st.error(f"Failed to load RAW season files.\n\n{e}")
+    _dbg_exception("load_raw_season", e)
     close_player_dialog()
     st.stop()
+t1 = _now()
 
 # Date range
 drafts_valid_dt = drafts[drafts["start_dt"].notna()].copy()
@@ -1424,7 +1457,7 @@ elif prev_sig != filter_sig:
     st.session_state["filter_sig"] = filter_sig
 
 # ============================================================
-# ✅ SAFE CACHE (handles old/new formats, prevents KeyError)
+# SAFE CACHE (with option to keep it light)
 # ============================================================
 if "board_cache" not in st.session_state or not isinstance(st.session_state["board_cache"], dict):
     st.session_state["board_cache"] = {}
@@ -1442,187 +1475,259 @@ if "sig" in bc and "cache" in bc and len(bc) <= 2:
 
 cache = bc.get(str(filter_sig))
 
-MAX_CACHE_ENTRIES = 6
+MAX_CACHE_ENTRIES = 4 if LIGHT_CACHE_ONLY else 6
 if len(bc) > MAX_CACHE_ENTRIES:
     keys = list(bc.keys())
     for k in keys[:-MAX_CACHE_ENTRIES]:
         bc.pop(k, None)
 
-if cache is None:
-    drafts_f = filter_drafts(
-        drafts=drafts,
-        leagues=leagues,
-        season=int(season),
-        draft_status=filter_draft_status,
-        draft_type=filter_draft_type,
-        scoring_types=filter_scoring,
-        league_sizes=[int(num_teams)],
-        min_rounds=min_rounds_val,
-        max_rounds=max_rounds_val,
-        date_min=date_min,
-        date_max=date_max,
-        te_premium_only=te_premium_only,
-    )
+# ------------------------------------------------------------
+# Build cache if missing (instrument heavily)
+# ------------------------------------------------------------
+build_t0 = _now()
+build_meta: Dict[str, Any] = {}
 
-    months_in_scope = sorted(
-        [
-            m
-            for m in drafts_f.get("start_month", pd.Series([], dtype="string")).dropna().unique().tolist()
-        ]
-    )
+try:
+    if cache is None:
+        mode = "auction" if board_kind.startswith("Auction") else "adp"
 
-    num_months_in_scope = len(months_in_scope)
-    required_player_drafts = int(min_drafts_per_month) * max(num_months_in_scope, 1)
-
-    if len(drafts_f) == 0:
-        st.warning("No drafts match your filters. Relax filters and try again.")
-        close_player_dialog()
-        st.stop()
-
-    players_df = load_players_df()
-
-    try:
-        ppg_df = load_ppg(int(ppg_season))
-    except Exception as e:
-        ppg_df = pd.DataFrame(columns=["player_id", "ppg", "games_played", "fantasy_pts"])
-        st.warning(f"Could not load PPG for {ppg_season}: {e}")
-
-    mode = "auction" if board_kind.startswith("Auction") else "adp"
-
-    extra_meta = pd.DataFrame()
-    picks_for_pool = picks.copy()
-    include_positions = ["QB", "RB", "WR", "TE"]
-
-    if (
-        mode == "adp"
-        and board_kind.startswith("Startup")
-        and startup_inclusion_mode == "Include rookie picks (K placeholders)"
-    ):
-        rp_picks, rp_meta = build_rookie_pick_placeholders(
-            picks=picks,
-            drafts_filtered=drafts_f,
-            players_df=players_df,
-            early_rounds=int(kicker_placeholder_rounds),
+        # 1) filter drafts
+        fd_t0 = _now()
+        drafts_f = filter_drafts(
+            drafts=drafts,
+            leagues=leagues,
+            season=int(season),
+            draft_status=filter_draft_status,
+            draft_type=filter_draft_type,
+            scoring_types=filter_scoring,
+            league_sizes=[int(num_teams)],
+            min_rounds=min_rounds_val,
+            max_rounds=max_rounds_val,
+            date_min=date_min,
+            date_max=date_max,
+            te_premium_only=te_premium_only,
         )
+        fd_t1 = _now()
+        build_meta["drafts_f_time"] = _fmt_secs(fd_t1 - fd_t0)
+        build_meta["drafts_f_rows"] = int(len(drafts_f))
+        build_meta["drafts_f_mem_mb"] = round(_df_mem_mb(drafts_f), 2)
 
-        if not rp_picks.empty:
-            common_cols = [c for c in picks_for_pool.columns if c in rp_picks.columns]
-            picks_for_pool = pd.concat([picks_for_pool, rp_picks[common_cols]], ignore_index=True)
-            extra_meta = rp_meta.copy()
+        if len(drafts_f) == 0:
+            st.warning("No drafts match your filters. Relax filters and try again.")
+            close_player_dialog()
+            st.stop()
 
-        include_positions = ["QB", "RB", "WR", "TE", "RDP"]
+        # 2) month requirement
+        months_in_scope = sorted([m for m in drafts_f.get("start_month", pd.Series([], dtype="string")).dropna().unique().tolist()])
+        num_months_in_scope = len(months_in_scope)
+        required_player_drafts = int(min_drafts_per_month) * max(num_months_in_scope, 1)
+        build_meta["months_in_scope"] = num_months_in_scope
+        build_meta["required_player_drafts"] = required_player_drafts
 
-    if mode == "auction":
-        pool = compute_player_auction_stats(
-            picks=picks_for_pool,
-            players_df=players_df,
-            drafts_filtered=drafts_f,
-            ppg_df=ppg_df,
-            include_positions=["QB", "RB", "WR", "TE"],
-        )
-        if pool.empty:
-            st.warning(
-                "Auction board is empty.\n\n"
-                "Most common causes:\n"
-                "1) No auction drafts in filters\n"
-                "2) picks missing md_amount\n"
-                "3) Date range excludes auctions"
+        # 3) players + ppg
+        pl_t0 = _now()
+        players_df = load_players_df()
+        pl_t1 = _now()
+        build_meta["players_time"] = _fmt_secs(pl_t1 - pl_t0)
+        build_meta["players_rows"] = int(len(players_df))
+        build_meta["players_mem_mb"] = round(_df_mem_mb(players_df), 2)
+
+        ppg_t0 = _now()
+        try:
+            ppg_df = load_ppg(int(ppg_season))
+        except Exception as e:
+            ppg_df = pd.DataFrame(columns=["player_id", "ppg", "games_played", "fantasy_pts"])
+            st.warning(f"Could not load PPG for {ppg_season}: {e}")
+        ppg_t1 = _now()
+        build_meta["ppg_time"] = _fmt_secs(ppg_t1 - ppg_t0)
+        build_meta["ppg_rows"] = int(len(ppg_df))
+        build_meta["ppg_mem_mb"] = round(_df_mem_mb(ppg_df), 2)
+
+        # 4) build pool
+        picks_for_pool = picks.copy()
+        include_positions = ["QB", "RB", "WR", "TE"]
+        extra_meta = pd.DataFrame()
+
+        rp_t0 = _now()
+        if (
+            mode == "adp"
+            and board_kind.startswith("Startup")
+            and startup_inclusion_mode == "Include rookie picks (K placeholders)"
+        ):
+            rp_picks, rp_meta = build_rookie_pick_placeholders(
+                picks=picks,
+                drafts_filtered=drafts_f,
+                players_df=players_df,
+                early_rounds=int(kicker_placeholder_rounds),
             )
+            if not rp_picks.empty:
+                common_cols = [c for c in picks_for_pool.columns if c in rp_picks.columns]
+                picks_for_pool = pd.concat([picks_for_pool, rp_picks[common_cols]], ignore_index=True)
+                extra_meta = rp_meta.copy()
+            include_positions = ["QB", "RB", "WR", "TE", "RDP"]
+        rp_t1 = _now()
+        build_meta["rookie_placeholder_time"] = _fmt_secs(rp_t1 - rp_t0)
+
+        pool_t0 = _now()
+        if mode == "auction":
+            pool = compute_player_auction_stats(
+                picks=picks_for_pool,
+                players_df=players_df,
+                drafts_filtered=drafts_f,
+                ppg_df=ppg_df,
+                include_positions=["QB", "RB", "WR", "TE"],
+            )
+            if pool.empty:
+                st.warning(
+                    "Auction board is empty.\n\n"
+                    "Most common causes:\n"
+                    "1) No auction drafts in filters\n"
+                    "2) picks missing md_amount\n"
+                    "3) Date range excludes auctions"
+                )
+                close_player_dialog()
+                st.stop()
+        else:
+            pool = compute_player_pick_stats(
+                picks=picks_for_pool,
+                players_df=players_df,
+                drafts_filtered=drafts_f,
+                ppg_df=ppg_df,
+                include_positions=include_positions,
+                extra_meta=extra_meta,
+            )
+        pool_t1 = _now()
+        build_meta["pool_time"] = _fmt_secs(pool_t1 - pool_t0)
+        build_meta["pool_rows"] = int(len(pool))
+        build_meta["pool_mem_mb"] = round(_df_mem_mb(pool), 2)
+
+        # 5) apply min drafts per month requirement
+        pf_t0 = _now()
+        pool = pool[pool["drafts"] >= required_player_drafts].copy()
+        pf_t1 = _now()
+        build_meta["pool_filter_time"] = _fmt_secs(pf_t1 - pf_t0)
+        build_meta["pool_rows_after_minreq"] = int(len(pool))
+        build_meta["pool_mem_mb_after_minreq"] = round(_df_mem_mb(pool), 2)
+
+        if pool.empty:
+            st.warning("No entities meet minimum draft requirements.\nTry lowering Min drafts per month.")
             close_player_dialog()
             st.stop()
-    else:
-        pool = compute_player_pick_stats(
-            picks=picks_for_pool,
-            players_df=players_df,
-            drafts_filtered=drafts_f,
-            ppg_df=ppg_df,
-            include_positions=include_positions,
-            extra_meta=extra_meta,
-        )
 
-    pool = pool[pool["drafts"] >= required_player_drafts].copy()
+        pool_for_board = pool.copy()
 
-    if pool.empty:
-        st.warning("No entities meet minimum draft requirements.\nTry lowering Min drafts per month.")
-        close_player_dialog()
-        st.stop()
+        # 6) rookie filtering for rookie board
+        rook_t0 = _now()
+        if mode == "adp" and board_kind.startswith("Rookie"):
+            pool_for_board = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=True)
+            if pool_for_board.empty:
+                st.warning("No rookie-eligible players.")
+                close_player_dialog()
+                st.stop()
+        if mode == "adp" and board_kind.startswith("Startup"):
+            if startup_inclusion_mode == "Exclude rookies and rookie picks":
+                pool_for_board = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=False)
+                if "is_rookie_pick" in pool_for_board.columns:
+                    pool_for_board = pool_for_board[~pool_for_board["is_rookie_pick"].astype(bool)].copy()
+        rook_t1 = _now()
+        build_meta["rookie_filter_time"] = _fmt_secs(rook_t1 - rook_t0)
+        build_meta["pool_for_board_rows"] = int(len(pool_for_board))
+        build_meta["pool_for_board_mem_mb"] = round(_df_mem_mb(pool_for_board), 2)
 
-    pool_for_board = pool.copy()
+        pool_for_board["position"] = pool_for_board["position"].map(normalize_pos)
 
-    if mode == "adp" and board_kind.startswith("Rookie"):
-        pool_for_board = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=True)
-        if pool_for_board.empty:
-            st.warning("No rookie-eligible players.")
-            close_player_dialog()
-            st.stop()
-
-    if mode == "adp" and board_kind.startswith("Startup"):
-        if startup_inclusion_mode == "Exclude rookies and rookie picks":
-            pool_for_board = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=False)
-            if "is_rookie_pick" in pool_for_board.columns:
-                pool_for_board = pool_for_board[~pool_for_board["is_rookie_pick"].astype(bool)].copy()
-
-    pool_for_board["position"] = pool_for_board["position"].map(normalize_pos)
-
-    if mode == "auction":
-        pool_for_board["avg_price"] = pd.to_numeric(pool_for_board["avg_price"], errors="coerce")
-
-        pool_for_board = pool_for_board.sort_values(["position", "avg_price"], ascending=[True, False]).reset_index(drop=True)
-        pool_for_board["pos_rank"] = pool_for_board.groupby("position").cumcount() + 1
-
-        mapping = build_board_map_snake_by_col(
-            pool_for_board,
-            int(num_teams),
-            int(num_rounds),
-            sort_col="avg_price",
-            asc=False,
-        )
-    else:
-        pool_for_board["adp"] = pd.to_numeric(pool_for_board["adp"], errors="coerce")
-
-        pool_for_board = pool_for_board.sort_values(["position", "adp"], ascending=[True, True]).reset_index(drop=True)
-        pool_for_board["pos_rank"] = pool_for_board.groupby("position").cumcount() + 1
-
-        if board_kind.startswith("Startup"):
+        # 7) pos rank + mapping
+        map_t0 = _now()
+        if mode == "auction":
+            pool_for_board["avg_price"] = pd.to_numeric(pool_for_board["avg_price"], errors="coerce")
+            pool_for_board = pool_for_board.sort_values(["position", "avg_price"], ascending=[True, False]).reset_index(drop=True)
+            pool_for_board["pos_rank"] = pool_for_board.groupby("position").cumcount() + 1
             mapping = build_board_map_snake_by_col(
                 pool_for_board,
                 int(num_teams),
                 int(num_rounds),
-                sort_col="adp",
-                asc=True,
+                sort_col="avg_price",
+                asc=False,
             )
         else:
-            mapping = build_board_map_linear_by_col(
-                pool_for_board,
-                int(num_teams),
-                int(num_rounds),
-                sort_col="adp",
-                asc=True,
-            )
+            pool_for_board["adp"] = pd.to_numeric(pool_for_board["adp"], errors="coerce")
+            pool_for_board = pool_for_board.sort_values(["position", "adp"], ascending=[True, True]).reset_index(drop=True)
+            pool_for_board["pos_rank"] = pool_for_board.groupby("position").cumcount() + 1
 
-    cache = {
-        "mode": mode,
-        "drafts_f": drafts_f,
-        "picks_for_pool": picks_for_pool,
-        "pool_for_board": pool_for_board,
-        "mapping": mapping,
-        "required_player_drafts": required_player_drafts,
-        "num_months_in_scope": num_months_in_scope,
-    }
-    st.session_state["board_cache"][str(filter_sig)] = cache
+            if board_kind.startswith("Startup"):
+                mapping = build_board_map_snake_by_col(
+                    pool_for_board,
+                    int(num_teams),
+                    int(num_rounds),
+                    sort_col="adp",
+                    asc=True,
+                )
+            else:
+                mapping = build_board_map_linear_by_col(
+                    pool_for_board,
+                    int(num_teams),
+                    int(num_rounds),
+                    sort_col="adp",
+                    asc=True,
+                )
+        map_t1 = _now()
+        build_meta["mapping_time"] = _fmt_secs(map_t1 - map_t0)
+        build_meta["mapping_cells"] = len(mapping)
 
-# Use cached artifacts (no recompute on tile click)
+        # 8) cache object (optionally light)
+        # BIG WARNING: storing large DataFrames in session_state can OOM and hard-crash.
+        if LIGHT_CACHE_ONLY:
+            # Keep only lightweight artifacts; keep_draft_ids rather than full picks/drafts DF
+            keep_draft_ids = set(drafts_f["draft_id"].astype(str).unique())
+            cache = {
+                "mode": mode,
+                "keep_draft_ids": keep_draft_ids,     # set of strings (much smaller than DF)
+                "drafts_f_small": drafts_f[["draft_id", "start_month"]].copy(),  # small DF used for trends
+                "pool_for_board": pool_for_board,     # still can be large; needed to render board + dialog lookup
+                "mapping": mapping,
+                "required_player_drafts": required_player_drafts,
+                "num_months_in_scope": num_months_in_scope,
+            }
+        else:
+            cache = {
+                "mode": mode,
+                "drafts_f": drafts_f,
+                "picks_for_pool": picks_for_pool,
+                "pool_for_board": pool_for_board,
+                "mapping": mapping,
+                "required_player_drafts": required_player_drafts,
+                "num_months_in_scope": num_months_in_scope,
+            }
+
+        st.session_state["board_cache"][str(filter_sig)] = cache
+
+except Exception as e:
+    _dbg_exception("board build / caching", e)
+    close_player_dialog()
+    st.stop()
+
+build_t1 = _now()
+
+# Use cached artifacts
+cache = st.session_state["board_cache"].get(str(filter_sig))
 mode = cache["mode"]
-drafts_f = cache["drafts_f"]
-picks_for_pool = cache["picks_for_pool"]
-pool_for_board = cache["pool_for_board"]
 mapping = cache["mapping"]
+pool_for_board = cache["pool_for_board"]
 required_player_drafts = cache["required_player_drafts"]
 num_months_in_scope = cache["num_months_in_scope"]
 
+# For trends + dialog subset, reconstruct minimal draft/pick context as needed
+if LIGHT_CACHE_ONLY:
+    keep_draft_ids = cache["keep_draft_ids"]
+    drafts_f_small = cache["drafts_f_small"]  # draft_id, start_month
+    # picks_for_pool not cached; use picks directly (still in memory from load_raw_season)
+else:
+    drafts_f_small = cache["drafts_f"][["draft_id", "start_month"]].copy()
+    keep_draft_ids = set(cache["drafts_f"]["draft_id"].astype(str).unique())
+
 # Summary metrics
 m1, m2, m3 = st.columns(3)
-m1.metric("Drafts", f"{len(drafts_f):,}")
+m1.metric("Drafts", f"{len(keep_draft_ids):,}")
 m2.metric("Months in date range", f"{num_months_in_scope:,}")
 m3.metric("Min drafts per entity", f"{required_player_drafts:,}")
 
@@ -1645,49 +1750,84 @@ render_board_clickable_tiles(
     is_snake_board=is_snake_board,
 )
 
-# Dialog (only computes tiny subsets + trend; does not rebuild board)
+# -----------------------------
+# DEBUG PANELS
+# -----------------------------
+if DEBUG:
+    st.divider()
+    _dbg_header("timing + memory + cache")
+    st.write(
+        {
+            "rss_mb (best-effort)": _get_rss_mb(),
+            "load_raw_season_time": _fmt_secs(t1 - t0),
+            "drafts_shape": drafts.shape,
+            "drafts_mem_mb": round(_df_mem_mb(drafts), 2),
+            "picks_shape": picks.shape,
+            "picks_mem_mb": round(_df_mem_mb(picks), 2),
+            "leagues_shape": leagues.shape,
+            "leagues_mem_mb": round(_df_mem_mb(leagues), 2),
+            "board_build_time": _fmt_secs(build_t1 - build_t0),
+            "build_meta": build_meta,
+            "cache_entries": len(st.session_state.get("board_cache", {})),
+            "LIGHT_CACHE_ONLY": LIGHT_CACHE_ONLY,
+        }
+    )
+    st.caption("If you see rss_mb spike massively or picks_mem_mb huge, you’re likely getting OOM/SIGKILL.")
+
+    with st.expander("DEBUG: pool_for_board preview", expanded=False):
+        try:
+            _dbg_df_info("pool_for_board", pool_for_board, head=5)
+        except Exception as e:
+            _dbg_exception("pool_for_board preview", e)
+
+# -----------------------------
+# Dialog / quick view
+# -----------------------------
 pid = st.session_state.get("selected_pid", None)
 if pid and st.session_state.get("dialog_open", False):
-    sel = pool_for_board[pool_for_board["player_id"].astype(str) == str(pid)].head(1)
-    if sel.empty:
-        st.warning("Selected entity is not in the current pool (filters may have changed). Click another square.")
-        close_player_dialog()
-    else:
-        sel_row = sel.iloc[0]
-
-        if mode == "auction":
-            p_sub = picks_for_pool.copy()
-            p_sub["draft_id"] = p_sub["draft_id"].astype(str)
-            p_sub["player_id"] = p_sub["player_id"].astype(str)
-            p_sub = p_sub[
-                (p_sub["player_id"] == str(pid))
-                & (p_sub["draft_id"].isin(set(drafts_f["draft_id"].astype(str))))
-            ].copy()
-
-            if "md_amount" in p_sub.columns:
-                p_sub["amount"] = pd.to_numeric(p_sub["md_amount"], errors="coerce")
-                p_sub = p_sub[p_sub["amount"].notna()].copy()
-            else:
-                p_sub = p_sub.iloc[0:0].copy()
-                p_sub["amount"] = np.nan
-
-            trend = player_monthly_trend_price(picks_for_pool, drafts_f, str(pid), last_n_months=5)
-            show_player_dialog("auction", sel_row, int(ppg_season), p_sub, trend)
-
+    try:
+        sel = pool_for_board[pool_for_board["player_id"].astype(str) == str(pid)].head(1)
+        if sel.empty:
+            st.warning("Selected entity is not in the current pool (filters may have changed). Click another square.")
+            close_player_dialog()
         else:
-            p_sub = picks_for_pool.copy()
+            sel_row = sel.iloc[0]
+
+            # Build minimal subset from picks each time; avoids caching giant picks_for_pool.
+            p_sub = picks.copy()
             p_sub["draft_id"] = p_sub["draft_id"].astype(str)
             p_sub["player_id"] = p_sub["player_id"].astype(str)
-            p_sub = p_sub[
-                (p_sub["player_id"] == str(pid))
-                & (p_sub["draft_id"].isin(set(drafts_f["draft_id"].astype(str))))
-            ].copy()
+            p_sub = p_sub[(p_sub["player_id"] == str(pid)) & (p_sub["draft_id"].isin(keep_draft_ids))].copy()
 
-            p_sub["pick_no_calc"] = infer_pick_no(p_sub)
-            p_sub["pick_no_calc"] = pd.to_numeric(p_sub["pick_no_calc"], errors="coerce")
-            p_sub = p_sub[p_sub["pick_no_calc"].notna()].copy()
+            if mode == "auction":
+                if "md_amount" in p_sub.columns:
+                    p_sub["amount"] = pd.to_numeric(p_sub["md_amount"], errors="coerce")
+                    p_sub = p_sub[p_sub["amount"].notna()].copy()
+                else:
+                    p_sub = p_sub.iloc[0:0].copy()
+                    p_sub["amount"] = np.nan
 
-            trend = player_monthly_trend_adp(picks_for_pool, drafts_f, str(pid), last_n_months=5)
-            show_player_dialog("adp", sel_row, int(ppg_season), p_sub, trend)
+                trend = player_monthly_trend_price(picks, drafts_f_small, str(pid), last_n_months=5)
+
+                if DISABLE_DIALOG or _DIALOG_FN is None:
+                    render_player_panel_inline("auction", sel_row, int(ppg_season), p_sub, trend)
+                else:
+                    show_player_dialog("auction", sel_row, int(ppg_season), p_sub, trend)
+
+            else:
+                p_sub["pick_no_calc"] = infer_pick_no(p_sub)
+                p_sub["pick_no_calc"] = pd.to_numeric(p_sub["pick_no_calc"], errors="coerce")
+                p_sub = p_sub[p_sub["pick_no_calc"].notna()].copy()
+
+                trend = player_monthly_trend_adp(picks, drafts_f_small, str(pid), last_n_months=5)
+
+                if DISABLE_DIALOG or _DIALOG_FN is None:
+                    render_player_panel_inline("adp", sel_row, int(ppg_season), p_sub, trend)
+                else:
+                    show_player_dialog("adp", sel_row, int(ppg_season), p_sub, trend)
+
+    except Exception as e:
+        _dbg_exception("dialog selection flow", e)
+        close_player_dialog()
 
 st.caption("Tip: drafts missing start_dt are excluded by date filters (invalid start_time).")
