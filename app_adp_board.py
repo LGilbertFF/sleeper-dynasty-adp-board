@@ -9,9 +9,14 @@
 # - Adds a toggle to disable caching big DataFrames in session_state
 # - Makes dialogs version-safe (st.dialog / st.experimental_dialog / inline fallback)
 #
-# If the app hard-crashes (OOM / SIGKILL) and you don't get a traceback:
-# - Enable "Light cache only" + "Disable dialog" and try the same season changes.
-# - Watch the "DEBUG: memory + sizes" section for what explodes.
+# CRASH FIX (timestamp overflow):
+# - Robust add_time_columns() that:
+#   * never casts timestamps to float64 prior to pd.to_datetime(..., unit="ms")
+#   * detects seconds vs milliseconds
+#   * drops out-of-range junk safely to NA
+#
+# NOTE:
+# - Replaced deprecated use_container_width=True with width="stretch"
 # ============================================================
 
 import os
@@ -76,7 +81,7 @@ def _dbg_kv(k: str, v: Any):
 def _dbg_df_info(name: str, df: pd.DataFrame, head: int = 3):
     st.markdown(f"**{name}**: shape={df.shape}, mem≈{_df_mem_mb(df):,.2f} MB")
     st.write("columns:", list(df.columns))
-    st.dataframe(df.head(head), use_container_width=True)
+    st.dataframe(df.head(head), width="stretch")
 
 def _dbg_exception(context: str, e: Exception):
     st.error(f"❌ Exception in {context}: {type(e).__name__}: {e}")
@@ -385,30 +390,69 @@ def pick_best_data_dir() -> Tuple[str, str, str]:
     return project_root, raw_dir, snapshots_dir
 
 
+# ============================================================
+# CRASH FIX: Robust timestamp handling (seconds vs ms; no float64 cast)
+# ============================================================
 def add_time_columns(drafts: pd.DataFrame) -> pd.DataFrame:
+    """
+    Robustly derive:
+      - start_dt (timezone-aware UTC datetime)
+      - start_date (YYYY-MM-DD)
+      - start_month (YYYY-MM)
+
+    Fixes overflow encountered in multiply by:
+      - avoiding ms_int.astype("float64") before pd.to_datetime(..., unit="ms")
+      - detecting seconds vs milliseconds
+      - dropping out-of-range / junk values to NA
+    """
     df = drafts.copy()
 
+    # Pick source column
     if "start_time" in df.columns:
-        ts = df["start_time"]
+        raw = df["start_time"]
+        src_col = "start_time"
     elif "created" in df.columns:
-        ts = df["created"]
+        raw = df["created"]
+        src_col = "created"
     else:
         df["start_dt"] = pd.NaT
         df["start_date"] = pd.Series(pd.NA, index=df.index, dtype="string")
         df["start_month"] = pd.Series(pd.NA, index=df.index, dtype="string")
         return df
 
-    ms = pd.to_numeric(ts, errors="coerce")
-    lo = 946684800000  # 2000-01-01
-    hi = 2051222400000  # 2035-01-01
-    ms = ms.where((ms >= lo) & (ms <= hi))
+    # Safe numeric parse (still float in pandas, but we will not hand float64 into to_datetime)
+    ts_num = pd.to_numeric(raw, errors="coerce")
 
-    ms_int = ms.round().astype("Int64")
-    start_dt = pd.to_datetime(ms_int.astype("float64"), unit="ms", utc=True, errors="coerce")
+    # Wide-but-sane ranges to classify unit (2000..2035)
+    sec_lo, sec_hi = 946684800, 2051222400               # seconds epoch
+    ms_lo,  ms_hi  = 946684800000, 2051222400000         # milliseconds epoch
+
+    looks_sec = ts_num.between(sec_lo, sec_hi)
+    looks_ms  = ts_num.between(ms_lo, ms_hi)
+
+    # Build ms_fixed as nullable Int64, never float64
+    ms_fixed = pd.Series(pd.NA, index=df.index, dtype="Int64")
+    if looks_ms.any():
+        ms_fixed.loc[looks_ms] = ts_num.loc[looks_ms].round().astype("Int64")
+    if looks_sec.any():
+        ms_fixed.loc[looks_sec] = (ts_num.loc[looks_sec].round().astype("Int64") * 1000)
+
+    # Convert without float cast: object array carries ints + <NA>
+    arr = ms_fixed.to_numpy(dtype="object")
+    start_dt = pd.to_datetime(arr, unit="ms", utc=True, errors="coerce")
 
     df["start_dt"] = start_dt
     df["start_date"] = df["start_dt"].dt.strftime("%Y-%m-%d").astype("string")
     df["start_month"] = df["start_dt"].dt.strftime("%Y-%m").astype("string")
+
+    # Lightweight debug breadcrumbs (helpful if you want to inspect bad timestamps)
+    df["_time_src_col"] = src_col
+    df["_time_raw"] = raw.astype("string")
+    df["_time_numeric"] = ts_num
+    df["_time_looks_sec"] = looks_sec
+    df["_time_looks_ms"] = looks_ms
+    df["_time_ms_fixed"] = ms_fixed
+
     return df
 
 
@@ -646,7 +690,6 @@ def is_rookie_for_season_row(row: pd.Series, season: int) -> bool:
 def filter_rookies_by_season(df: pd.DataFrame, season: int, keep_rookies: bool) -> pd.DataFrame:
     if df.empty:
         return df
-    # apply() can be expensive; keep but instrument
     mask = df.apply(lambda r: is_rookie_for_season_row(r, season), axis=1)
     return df[mask].copy() if keep_rookies else df[~mask].copy()
 
@@ -1160,7 +1203,7 @@ def show_player_dialog(
                     plt.xlabel("Draft month")
                     plt.ylabel("Avg price ($)")
                     st.pyplot(fig2, clear_figure=True)
-                    st.dataframe(trend, use_container_width=True, height=180)
+                    st.dataframe(trend, width="stretch", height=180)
             else:
                 st.markdown("#### ADP trend by month (last 5 months present)")
                 if trend is None or trend.empty:
@@ -1172,7 +1215,7 @@ def show_player_dialog(
                     plt.xlabel("Draft month")
                     plt.ylabel("ADP (lower is earlier)")
                     st.pyplot(fig2, clear_figure=True)
-                    st.dataframe(trend, use_container_width=True, height=180)
+                    st.dataframe(trend, width="stretch", height=180)
 
         st.divider()
         if st.button("Close", type="primary", key="dlg_close_btn"):
@@ -1677,13 +1720,12 @@ try:
         # 8) cache object (optionally light)
         # BIG WARNING: storing large DataFrames in session_state can OOM and hard-crash.
         if LIGHT_CACHE_ONLY:
-            # Keep only lightweight artifacts; keep_draft_ids rather than full picks/drafts DF
             keep_draft_ids = set(drafts_f["draft_id"].astype(str).unique())
             cache = {
                 "mode": mode,
-                "keep_draft_ids": keep_draft_ids,     # set of strings (much smaller than DF)
-                "drafts_f_small": drafts_f[["draft_id", "start_month"]].copy(),  # small DF used for trends
-                "pool_for_board": pool_for_board,     # still can be large; needed to render board + dialog lookup
+                "keep_draft_ids": keep_draft_ids,
+                "drafts_f_small": drafts_f[["draft_id", "start_month"]].copy(),
+                "pool_for_board": pool_for_board,
                 "mapping": mapping,
                 "required_player_drafts": required_player_drafts,
                 "num_months_in_scope": num_months_in_scope,
@@ -1720,7 +1762,6 @@ num_months_in_scope = cache["num_months_in_scope"]
 if LIGHT_CACHE_ONLY:
     keep_draft_ids = cache["keep_draft_ids"]
     drafts_f_small = cache["drafts_f_small"]  # draft_id, start_month
-    # picks_for_pool not cached; use picks directly (still in memory from load_raw_season)
 else:
     drafts_f_small = cache["drafts_f"][["draft_id", "start_month"]].copy()
     keep_draft_ids = set(cache["drafts_f"]["draft_id"].astype(str).unique())
@@ -1780,6 +1821,22 @@ if DEBUG:
         except Exception as e:
             _dbg_exception("pool_for_board preview", e)
 
+    with st.expander("DEBUG: bad timestamps (if any)", expanded=False):
+        try:
+            # Show rows with numeric timestamp that did not parse (NaT)
+            if "_time_numeric" in drafts.columns and "start_dt" in drafts.columns:
+                bad = drafts[drafts["start_dt"].isna() & drafts["_time_numeric"].notna()].copy()
+                st.write({"bad_timestamp_rows": int(len(bad))})
+                if len(bad) > 0:
+                    cols = [c for c in [
+                        "draft_id", "league_id",
+                        "_time_src_col", "_time_raw", "_time_numeric",
+                        "_time_looks_sec", "_time_looks_ms", "_time_ms_fixed"
+                    ] if c in bad.columns]
+                    st.dataframe(bad[cols].head(50), width="stretch", height=240)
+        except Exception as e:
+            _dbg_exception("bad timestamp panel", e)
+
 # -----------------------------
 # Dialog / quick view
 # -----------------------------
@@ -1830,4 +1887,4 @@ if pid and st.session_state.get("dialog_open", False):
         _dbg_exception("dialog selection flow", e)
         close_player_dialog()
 
-st.caption("Tip: drafts missing start_dt are excluded by date filters (invalid start_time).")
+st.caption("Tip: drafts missing start_dt are excluded by date filters (invalid/unknown start_time).")
