@@ -257,6 +257,27 @@ def normalize_pos(pos: Any) -> str:
         return "UNK"
     return p
 
+def safe_mul(a, b, *, clip=1e12):
+    """
+    Multiply two arrays/Series safely:
+      - coerces to float64
+      - handles inf/NaN
+      - clips magnitude to avoid overflow cascades
+    """
+    a = pd.to_numeric(a, errors="coerce").astype("float64")
+    b = pd.to_numeric(b, errors="coerce").astype("float64")
+    out = a * b
+    out = np.where(np.isfinite(out), out, np.nan)
+    out = np.clip(out, -clip, clip)
+    return pd.Series(out)
+
+def safe_series(x, *, fill=0.0, clip=1e12):
+    s = pd.to_numeric(x, errors="coerce").astype("float64")
+    s = s.replace([np.inf, -np.inf], np.nan).fillna(fill)
+    if clip is not None:
+        s = s.clip(-clip, clip)
+    return s
+
 
 def safe_str(x: Any) -> str:
     if x is None:
@@ -431,9 +452,43 @@ def safe_col(df: pd.DataFrame, col: str) -> pd.Series:
 
 
 def calc_fantasy_points(df: pd.DataFrame, scoring: Dict[str, float]) -> pd.Series:
-    pts = pd.Series(np.zeros(len(df)), index=df.index, dtype="float64")
+    """
+    Robust fantasy points calc:
+    - forces numeric float64
+    - converts bad strings -> NaN -> 0
+    - replaces inf/-inf -> 0
+    - clips extreme values to prevent overflow in multiply
+    """
+    pts = pd.Series(0.0, index=df.index, dtype="float64")
+
+    # tune this if you want; 1e9 is already "way too big" for fantasy stats
+    CLIP = 1e9
+
     for stat, w in scoring.items():
-        pts = pts + safe_col(df, stat) * float(w)
+        try:
+            x = safe_col(df, stat)
+        except Exception:
+            # if safe_col itself ever fails, treat as 0
+            continue
+
+        # Force numeric float64 + sanitize
+        x = pd.to_numeric(x, errors="coerce").astype("float64")
+        x = x.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+        # Clip to avoid overflow during x*w
+        x = x.clip(-CLIP, CLIP)
+
+        ww = float(w)
+
+        # Multiply in float64; extra safety clip after multiply
+        add = x * ww
+        add = add.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        add = add.clip(-CLIP, CLIP)
+
+        pts = pts + add
+
+    # final cleanup
+    pts = pts.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return pts
 
 
@@ -493,7 +548,14 @@ def infer_pick_no(picks: pd.DataFrame) -> pd.Series:
     if "round" in picks.columns and "draft_slot" in picks.columns:
         r = pd.to_numeric(picks["round"], errors="coerce")
         ds = pd.to_numeric(picks["draft_slot"], errors="coerce")
-        return (r - 1) * 12 + ds
+
+        # ensure float64 and avoid weird huge values / inf
+        r = r.astype("float64").replace([np.inf, -np.inf], np.nan)
+        ds = ds.astype("float64").replace([np.inf, -np.inf], np.nan)
+
+        out = (r - 1.0) * 12.0 + ds
+        out = out.replace([np.inf, -np.inf], np.nan)
+        return out
 
     return pd.Series(np.nan, index=picks.index)
 
