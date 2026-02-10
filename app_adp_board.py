@@ -8,7 +8,7 @@
 # - Do NOT cache big picks DataFrames in st.cache_data or st.session_state.
 # - Make PPG optional (OFF by default) to avoid large API payloads.
 #
-# FIXES (2026-02-09 / 2026-02-10):
+# FIXES (2026-02-09 / 2026-02-10 / 2026-02-11):
 # ✅ Rookie boards wrong (older seasons) -> STRICT rookie eligibility:
 #    rookie_year == season OR (rookie_year missing AND years_exp == 0)
 # ✅ Startup inclusion "Include rookie picks (K placeholders)" should NOT include rookie players
@@ -16,7 +16,7 @@
 # ✅ Player cards: do NOT show name over picture; show name ONLY in colored bar
 # ✅ Player cards: show ADP slot label (1.01 / 2.03 etc.) on ADP boards (not "ADP + drafts")
 # ✅ Dialog: positional rank format "RB16", "WR2", etc.
-# ✅ Dialog: ADP/PPG values not cut off -> CSS override for metric value
+# ✅ Dialog: ADP/PPG/Pos Rank not cut off -> widen dialog + allow metric value wrap + reduce metrics per row
 # ✅ Add back month-to-month trend graph (ADP or Avg$) for selected player
 # ✅ Export: download CSV (long-form list) for current selected board (all filters)
 #
@@ -115,11 +115,23 @@ APP_CSS = """
   .block-container { padding-top: 1.2rem; padding-bottom: 3rem; }
   h1, h2, h3 { letter-spacing: -0.02em; }
 
-  /* Fix Streamlit metric truncation ("2..." / "—" cut off) */
+  /* --- Make the player dialog wider so metrics don't clip --- */
+  div[data-testid="stDialog"] > div[role="dialog"] {
+    width: 1040px !important;
+    max-width: 1040px !important;
+  }
+  /* Some Streamlit versions nest differently */
+  div[role="dialog"] {
+    width: 1040px !important;
+    max-width: 1040px !important;
+  }
+
+  /* --- Stop metric truncation: allow wrapping --- */
   div[data-testid="stMetricValue"] {
     overflow: visible !important;
     text-overflow: clip !important;
-    white-space: nowrap !important;
+    white-space: normal !important;   /* key change (wrap) */
+    line-height: 1.05 !important;
     max-width: 100% !important;
   }
   div[data-testid="stMetricLabel"] {
@@ -1020,6 +1032,7 @@ def show_player_dialog(
 
             pos_rank_fmt = _pos_rank_label(sel_pos, pos_rank_val)
 
+            # ---- IMPORTANT: 3 per row max to avoid clipping ----
             if mode == "auction":
                 avg_price = sel_row.get("avg_price", np.nan)
                 med_price = sel_row.get("med_price", np.nan)
@@ -1027,35 +1040,35 @@ def show_player_dialog(
                 max_price = sel_row.get("max_price", np.nan)
                 sales = sel_row.get("sales", np.nan)
 
-                r1 = st.columns(4)
+                r1 = st.columns(3)
                 r1[0].metric("Avg $", f"{float(avg_price):.2f}" if pd.notna(avg_price) else "—")
                 r1[1].metric("Median $", f"{float(med_price):.2f}" if pd.notna(med_price) else "—")
-                r1[2].metric("Sales", f"{int(sales):,}" if pd.notna(sales) else "—")
-                r1[3].metric("Pos Rank", pos_rank_fmt if pos_rank_fmt else "—")
+                r1[2].metric("Pos Rank", pos_rank_fmt if pos_rank_fmt else "—")
 
                 r2 = st.columns(3)
-                r2[0].metric("Min $", f"{float(min_price):.0f}" if pd.notna(min_price) else "—")
-                r2[1].metric("Max $", f"{float(max_price):.0f}" if pd.notna(max_price) else "—")
-                r2[2].metric(f"PPG {ppg_season}", f"{float(ppg_val):.2f}" if pd.notna(ppg_val) else "—")
+                r2[0].metric("Sales", f"{int(sales):,}" if pd.notna(sales) else "—")
+                r2[1].metric("Min $", f"{float(min_price):.0f}" if pd.notna(min_price) else "—")
+                r2[2].metric("Max $", f"{float(max_price):.0f}" if pd.notna(max_price) else "—")
 
-                r3 = st.columns(2)
-                r3[0].metric("Drafts", f"{int(drafts_val):,}" if pd.notna(drafts_val) else "—")
-                r3[1].metric("Team", sel_team if sel_team else "—")
+                r3 = st.columns(3)
+                r3[0].metric(f"PPG {ppg_season}", f"{float(ppg_val):.2f}" if pd.notna(ppg_val) else "—")
+                r3[1].metric("Drafts", f"{int(drafts_val):,}" if pd.notna(drafts_val) else "—")
+                r3[2].metric("Team", sel_team if sel_team else "—")
 
             else:
                 adp_val = sel_row.get("adp", np.nan)
                 min_pick_val = sel_row.get("min_pick", np.nan)
                 max_pick_val = sel_row.get("max_pick", np.nan)
 
-                r1 = st.columns(4)
+                r1 = st.columns(3)
                 r1[0].metric("ADP", f"{float(adp_val):.2f}" if pd.notna(adp_val) else "—")
                 r1[1].metric(f"PPG {ppg_season}", f"{float(ppg_val):.2f}" if pd.notna(ppg_val) else "—")
-                r1[2].metric("Drafts", f"{int(drafts_val):,}" if pd.notna(drafts_val) else "—")
-                r1[3].metric("Pos Rank", pos_rank_fmt if pos_rank_fmt else "—")
+                r1[2].metric("Pos Rank", pos_rank_fmt if pos_rank_fmt else "—")
 
-                r2 = st.columns(2)
-                r2[0].metric("Min Pick", f"{float(min_pick_val):.0f}" if pd.notna(min_pick_val) else "—")
-                r2[1].metric("Max Pick", f"{float(max_pick_val):.0f}" if pd.notna(max_pick_val) else "—")
+                r2 = st.columns(3)
+                r2[0].metric("Drafts", f"{int(drafts_val):,}" if pd.notna(drafts_val) else "—")
+                r2[1].metric("Min Pick", f"{float(min_pick_val):.0f}" if pd.notna(min_pick_val) else "—")
+                r2[2].metric("Max Pick", f"{float(max_pick_val):.0f}" if pd.notna(max_pick_val) else "—")
 
         st.divider()
 
@@ -1072,12 +1085,11 @@ def show_player_dialog(
             psub["draft_id"] = psub["draft_id"].astype(str)
 
             if mode == "auction":
-                if "amount" not in psub.columns:
-                    if "md_amount" in psub.columns:
-                        psub["amount"] = pd.to_numeric(psub["md_amount"], errors="coerce")
+                if "amount" not in psub.columns and "md_amount" in psub.columns:
+                    psub["amount"] = pd.to_numeric(psub["md_amount"], errors="coerce")
                 psub = psub.merge(dm, on="draft_id", how="left")
                 tmp = psub.dropna(subset=["start_month"]).copy()
-                tmp["amount"] = pd.to_numeric(tmp["amount"], errors="coerce")
+                tmp["amount"] = pd.to_numeric(tmp.get("amount", np.nan), errors="coerce")
                 tmp = tmp.dropna(subset=["amount"])
                 if tmp.empty:
                     st.info("No auction prices found for this player across the filtered drafts.")
@@ -1124,11 +1136,10 @@ def show_player_dialog(
             if picks_subset is None or len(picks_subset) == 0:
                 st.info("No auction purchases found for this player in the filtered draft set.")
             else:
-                if "amount" not in picks_subset.columns:
-                    if "md_amount" in picks_subset.columns:
-                        picks_subset = picks_subset.copy()
-                        picks_subset["amount"] = pd.to_numeric(picks_subset["md_amount"], errors="coerce")
-                tmp = picks_subset.dropna(subset=["amount"]).copy()
+                tmp = picks_subset.copy()
+                if "amount" not in tmp.columns and "md_amount" in tmp.columns:
+                    tmp["amount"] = pd.to_numeric(tmp["md_amount"], errors="coerce")
+                tmp = tmp.dropna(subset=["amount"])
                 if tmp.empty:
                     st.info("No auction purchases found for this player in the filtered draft set.")
                 else:
@@ -1142,10 +1153,9 @@ def show_player_dialog(
             if picks_subset is None or len(picks_subset) == 0:
                 st.info("No pick rows found for this entity in the filtered draft set.")
             else:
-                if "pick_no_calc" not in picks_subset.columns:
-                    picks_subset = picks_subset.copy()
-                    picks_subset["pick_no_calc"] = infer_pick_no(picks_subset)
                 tmp = picks_subset.copy()
+                if "pick_no_calc" not in tmp.columns:
+                    tmp["pick_no_calc"] = infer_pick_no(tmp)
                 tmp["pick_no_calc"] = pd.to_numeric(tmp["pick_no_calc"], errors="coerce")
                 tmp = tmp.dropna(subset=["pick_no_calc"])
                 if tmp.empty:
@@ -1211,7 +1221,6 @@ def render_board_clickable_tiles(
                 pid = safe_str(cell.get("player_id", ""))
                 name = safe_str(cell.get("full_name", ""))
                 pos = normalize_pos(cell.get("position", "UNK"))
-                team = safe_str(cell.get("team", ""))
                 bg = POSITION_COLORS.get(pos, POSITION_COLORS["UNK"])
 
                 pos_rank = cell.get("pos_rank", None)
@@ -1225,11 +1234,9 @@ def render_board_clickable_tiles(
                     val = cell.get("avg_price", np.nan)
                     right_pill = f"${float(val):.0f}" if pd.notna(val) else "—"
                 else:
-                    # On ADP boards, always show the board slot label
                     if is_snake_board:
                         right_pill = format_pick_label_snake(r, t, int(num_teams))
                     else:
-                        # For linear boards, "team column" is pick_in_round
                         right_pill = format_pick_label_linear(r, t)
 
                 is_rp = bool(cell.get("is_rookie_pick", False)) or (pos == "RDP") or pid.startswith("ROOKIE_PICK_")
