@@ -8,6 +8,11 @@
 # - Do NOT cache big picks DataFrames in st.cache_data or st.session_state.
 # - Make PPG optional (OFF by default) to avoid large API payloads.
 #
+# FIXES (2026-02-09):
+# 1) Rookie boards blank -> make rookie eligibility robust (rookie_year in {season, season-1} OR years_exp <= 1)
+# 2) Wide board readability -> card bottom shows Rank+Team AND ADP/Avg$ + drafts (two meta rows)
+# 3) Export -> download CSV for current selected board (long-form list) reflecting all filters
+#
 # ============================================================
 
 import os
@@ -197,7 +202,7 @@ APP_CSS = """
     color: rgba(255,255,255,0.95);
     text-shadow: 0 1px 10px rgba(0,0,0,0.45);
   }
-  .meta {
+  .meta, .meta2 {
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -420,7 +425,9 @@ def load_drafts_leagues(raw_dir: str, season: int) -> Tuple[pd.DataFrame, pd.Dat
         "md_scoring_type", "st_teams", "st_rounds",
         "start_time", "created",
     ]
-    drafts_cols = [c for c in drafts_cols if c in pd.read_parquet(drafts_path, engine="pyarrow", columns=None).columns]  # safe if metadata ok
+    # metadata pass
+    meta_all = pd.read_parquet(drafts_path, engine="pyarrow", columns=None).columns
+    drafts_cols = [c for c in drafts_cols if c in meta_all]
 
     drafts = pd.read_parquet(drafts_path, engine="pyarrow", columns=drafts_cols)
     for col in ["draft_id", "league_id"]:
@@ -448,9 +455,6 @@ def load_picks_for_draft_ids(raw_dir: str, season: int, draft_ids: List[str]) ->
     if not os.path.exists(picks_path):
         raise FileNotFoundError(f"Missing RAW picks parquet:\n{picks_path}")
 
-    # Minimal columns needed to:
-    # - compute pick number (any of these might exist)
-    # - support auction price
     want = [
         "draft_id", "player_id",
         "pick_no", "overall_pick", "pick", "draft_pick", "pick_number",
@@ -458,7 +462,6 @@ def load_picks_for_draft_ids(raw_dir: str, season: int, draft_ids: List[str]) ->
         "md_amount",
     ]
 
-    # Read parquet metadata once to intersect available columns
     meta_cols = pd.read_parquet(picks_path, engine="pyarrow", columns=None).columns
     cols = [c for c in want if c in meta_cols]
     if "draft_id" not in cols or "player_id" not in cols:
@@ -466,15 +469,12 @@ def load_picks_for_draft_ids(raw_dir: str, season: int, draft_ids: List[str]) ->
 
     picks = pd.read_parquet(picks_path, engine="pyarrow", columns=cols)
 
-    # Normalize ids and filter early
     picks["draft_id"] = picks["draft_id"].astype(str)
     picks["player_id"] = picks["player_id"].astype(str)
 
-    # draft_ids can be large; convert to set for fast isin
     did_set = set(map(str, draft_ids))
     picks = picks[picks["draft_id"].isin(did_set)].copy()
 
-    # Downcast numeric columns where possible
     for c in ["round", "draft_slot", "pick_no", "overall_pick", "pick", "draft_pick", "pick_number", "md_amount"]:
         if c in picks.columns:
             picks[c] = pd.to_numeric(picks[c], errors="coerce")
@@ -651,14 +651,32 @@ def filter_drafts(
 
 
 # ============================================================
-# Rookie logic
+# Rookie logic (FIXED)
 # ============================================================
 def is_rookie_for_season_row(row: pd.Series, season: int) -> bool:
+    """
+    More robust 'rookie-eligible' logic:
+    - If rookie_year exists: treat rookie_year == season OR rookie_year == season-1 as eligible
+      (helps in offseason / data-lag situations).
+    - If rookie_year missing: use years_exp <= 1.
+    """
     ry = row.get("rookie_year", np.nan)
-    if pd.notna(ry):
-        return int(ry) == int(season)
     ye = row.get("years_exp", np.nan)
-    return pd.notna(ye) and int(ye) == 0
+
+    if pd.notna(ry):
+        try:
+            ry_i = int(ry)
+            return ry_i in {int(season), int(season) - 1}
+        except Exception:
+            pass
+
+    if pd.notna(ye):
+        try:
+            return int(ye) <= 1
+        except Exception:
+            pass
+
+    return False
 
 def filter_rookies_by_season(df: pd.DataFrame, season: int, keep_rookies: bool) -> pd.DataFrame:
     if df.empty:
@@ -1066,7 +1084,7 @@ def show_player_dialog(
 
 
 # ============================================================
-# Board renderer
+# Board renderer (FIXED card meta)
 # ============================================================
 def render_board_clickable_tiles(
     mapping: Dict[Tuple[int, int], Dict[str, Any]],
@@ -1115,14 +1133,23 @@ def render_board_clickable_tiles(
                 else:
                     rank_label = POSITION_TEXT.get(pos, pos)
 
+                # keep pick label pill for context
+                if is_snake_board:
+                    pick_label = format_pick_label_snake(r, t, int(num_teams))
+                else:
+                    pick_label = format_pick_label_linear(r, t)
+
+                # Primary value pill + drafts pill
                 if mode == "auction":
                     val = cell.get("avg_price", np.nan)
-                    right_pill = f"${float(val):.0f}" if pd.notna(val) else (team if team else "—")
+                    value_pill = f"Avg ${float(val):.0f}" if pd.notna(val) else "Avg $ —"
                 else:
-                    if is_snake_board:
-                        right_pill = format_pick_label_snake(r, t, int(num_teams))
-                    else:
-                        right_pill = format_pick_label_linear(r, t)
+                    adp_val = cell.get("adp", np.nan)
+                    value_pill = f"ADP {float(adp_val):.1f}" if pd.notna(adp_val) else "ADP —"
+
+                drafts_val = cell.get("drafts", np.nan)
+                drafts_pill = f"{int(drafts_val)} drafts" if pd.notna(drafts_val) else "drafts —"
+                team_pill = team if team else "—"
 
                 is_rp = bool(cell.get("is_rookie_pick", False)) or (pos == "RDP") or pid.startswith("ROOKIE_PICK_")
 
@@ -1137,7 +1164,11 @@ def render_board_clickable_tiles(
                     f"  <div class='name'>{name}</div>"
                     f"  <div class='meta'>"
                     f"    <span class='pill'>{rank_label}</span>"
-                    f"    <span class='pill'>{right_pill}</span>"
+                    f"    <span class='pill'>{team_pill}</span>"
+                    f"  </div>"
+                    f"  <div class='meta2'>"
+                    f"    <span class='pill'>{value_pill}</span>"
+                    f"    <span class='pill'>{drafts_pill}</span>"
                     f"  </div>"
                     f"</div>"
                 )
@@ -1382,7 +1413,6 @@ if mode == "adp" and board_kind.startswith("Startup") and startup_inclusion_mode
         early_rounds=int(kicker_placeholder_rounds),
     )
     if not rp_picks.empty:
-        # align columns
         common_cols = [c for c in picks_for_pool.columns if c in rp_picks.columns]
         picks_for_pool = pd.concat([picks_for_pool, rp_picks[common_cols]], ignore_index=True)
         extra_meta = rp_meta.copy()
@@ -1436,6 +1466,65 @@ if mode == "adp" and board_kind.startswith("Startup"):
             pool_for_board = pool_for_board[~pool_for_board["is_rookie_pick"].astype(bool)].copy()
 
 pool_for_board["position"] = pool_for_board["position"].map(normalize_pos)
+
+# ============================================================
+# Export current board (long-form list)  ✅ FIX #3
+# ============================================================
+st.divider()
+with st.expander("📤 Export current board (long-form list)", expanded=False):
+    export_df = pool_for_board.copy()
+
+    # Sort like the board is ranked
+    if mode == "auction":
+        export_df["avg_price"] = pd.to_numeric(export_df.get("avg_price", np.nan), errors="coerce")
+        export_df = export_df.sort_values(["avg_price", "drafts"], ascending=[False, False]).reset_index(drop=True)
+    else:
+        export_df["adp"] = pd.to_numeric(export_df.get("adp", np.nan), errors="coerce")
+        export_df = export_df.sort_values(["adp", "drafts"], ascending=[True, False]).reset_index(drop=True)
+
+    export_df.insert(0, "overall_rank", np.arange(1, len(export_df) + 1))
+
+    cols = [
+        "overall_rank",
+        "player_id",
+        "full_name",
+        "position",
+        "team",
+        "pos_rank",
+        "drafts",
+        "picks",
+        "adp",
+        "min_pick",
+        "max_pick",
+        "avg_price",
+        "med_price",
+        "min_price",
+        "max_price",
+        "ppg",
+        "games_played",
+        "fantasy_pts",
+        "rookie_year",
+        "years_exp",
+        "is_rookie_pick",
+    ]
+    cols = [c for c in cols if c in export_df.columns]
+    export_df = export_df[cols].copy()
+
+    csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+    safe_kind = (
+        board_kind.lower()
+        .replace(" ", "_")
+        .replace("(", "")
+        .replace(")", "")
+        .replace("/", "_")
+    )
+    st.download_button(
+        label="Download CSV (long-form list)",
+        data=csv_bytes,
+        file_name=f"sleeper_board_export_{safe_kind}_{int(season)}_{int(num_teams)}t_{int(num_rounds)}r.csv",
+        mime="text/csv",
+    )
+    st.caption("This export reflects all current filters and the selected board type.")
 
 # Pos ranks + mapping
 if mode == "auction":
