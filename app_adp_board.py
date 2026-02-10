@@ -8,14 +8,25 @@
 # - Do NOT cache big picks DataFrames in st.cache_data or st.session_state.
 # - Make PPG optional (OFF by default) to avoid large API payloads.
 #
-# FIXES (2026-02-09 / 2026-02-10 / 2026-02-11 / 2026-02-12):
-# ✅ TE Premium memory: do NOT load leagues unless TE Premium is ON
-# ✅ Rookie boards populate correctly by filtering to rookie-style drafts (linear + small st_rounds)
-# ✅ Rookies vs Rookie Picks are always separate:
-#    - Rookie ADP board: rookies (players) ONLY, never RDP placeholders
-#    - Startup board: "Include rookie picks (K placeholders)" keeps only RDP placeholders, excludes rookie players
-# ✅ Rookie eligibility stays season-correct (rookie_year == season OR (rookie_year missing AND years_exp == 0))
-# ✅ Debug panel includes players_df memory
+# FIXES (2026-02-09 / 2026-02-10 / 2026-02-11 / 2026-02-09b):
+# ✅ Rookie boards wrong (older seasons / rookies missing) -> STRICT rookie eligibility:
+#    rookie_year == season OR (rookie_year missing AND years_exp in {0,1})
+# ✅ Rookie board MUST show rookie PLAYERS only (never rookie-pick placeholders)
+# ✅ Startup inclusion "Include rookie picks (K placeholders)" should NOT include rookie players
+#    -> exclude rookies (players) but keep RDP placeholders
+# ✅ Player cards: do NOT show name over picture; show name ONLY in colored bar
+# ✅ Player cards: show ADP slot label (1.01 / 2.03 etc.) on ADP boards (not "ADP + drafts")
+# ✅ Dialog: positional rank format "RB16", "WR2", etc.
+# ✅ Dialog: ADP/PPG/Pos Rank not cut off -> widen dialog + allow metric value wrap + reduce metrics per row
+# ✅ Add back month-to-month trend graph (ADP or Avg$) for selected player
+# ✅ Export: download CSV (long-form list) for current selected board (all filters)
+#
+# MEMORY REDUCTION (2026-02-09):
+# ✅ Use pyarrow.dataset filter pushdown to load ONLY picks for filtered draft_ids
+# ✅ Aggregate picks FIRST (small), then merge players metadata
+# ✅ Cheap parquet schema reads (pq.ParquetFile)
+# ✅ Vectorized rookie filter (no axis=1 apply)
+# ✅ Reduce copies + smaller dtypes where safe + gc.collect after build
 #
 # ============================================================
 
@@ -122,6 +133,7 @@ APP_CSS = """
     width: 1040px !important;
     max-width: 1040px !important;
   }
+  /* Some Streamlit versions nest differently */
   div[role="dialog"] {
     width: 1040px !important;
     max-width: 1040px !important;
@@ -131,7 +143,7 @@ APP_CSS = """
   div[data-testid="stMetricValue"] {
     overflow: visible !important;
     text-overflow: clip !important;
-    white-space: normal !important;
+    white-space: normal !important;   /* key change (wrap) */
     line-height: 1.05 !important;
     max-width: 100% !important;
   }
@@ -443,7 +455,7 @@ def season_raw_paths(raw_dir: str, season: int) -> Tuple[str, str, str]:
 # LOADERS (memory-safe)
 # ============================================================
 @st.cache_data(show_spinner=False, max_entries=2, ttl=3600)
-def load_drafts_leagues(raw_dir: str, season: int, need_leagues: bool) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def load_drafts_leagues(raw_dir: str, season: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
     drafts_path, _picks_path, leagues_path = season_raw_paths(raw_dir, season)
     if not os.path.exists(drafts_path):
         raise FileNotFoundError(f"Missing RAW drafts parquet:\n{drafts_path}")
@@ -463,17 +475,12 @@ def load_drafts_leagues(raw_dir: str, season: int, need_leagues: bool) -> Tuple[
 
     drafts = add_time_columns(drafts)
 
-    # ✅ Only load leagues if TE premium filter is on (or otherwise needed)
-    if (not need_leagues) or (not os.path.exists(leagues_path)):
-        return drafts, pd.DataFrame()
+    leagues = pd.DataFrame()
+    if os.path.exists(leagues_path):
+        leagues = pd.read_parquet(leagues_path, engine="pyarrow")
+        if "league_id" in leagues.columns:
+            leagues["league_id"] = leagues["league_id"].astype("string")
 
-    leagues_schema = pq.ParquetFile(leagues_path).schema.names
-    league_cols = [c for c in ["league_id", "scoring_settings.bonus_rec_te"] if c in leagues_schema]
-    if not league_cols:
-        return drafts, pd.DataFrame()
-
-    leagues = pd.read_parquet(leagues_path, engine="pyarrow", columns=league_cols)
-    leagues["league_id"] = leagues["league_id"].astype("string")
     return drafts, leagues
 
 def load_picks_for_draft_ids(raw_dir: str, season: int, draft_ids: List[str]) -> pd.DataFrame:
@@ -627,10 +634,10 @@ def infer_pick_no(picks: pd.DataFrame) -> pd.Series:
                 return s
     if "round" in picks.columns and "draft_slot" in picks.columns:
         r = pd.to_numeric(picks["round"], errors="coerce").astype("float64")
-        ds_ = pd.to_numeric(picks["draft_slot"], errors="coerce").astype("float64")
+        ds = pd.to_numeric(picks["draft_slot"], errors="coerce").astype("float64")
         r = r.replace([np.inf, -np.inf], np.nan).where((r >= 1) & (r <= 80))
-        ds_ = ds_.replace([np.inf, -np.inf], np.nan).where((ds_ >= 1) & (ds_ <= 32))
-        return (r - 1.0) * 12.0 + ds_
+        ds = ds.replace([np.inf, -np.inf], np.nan).where((ds >= 1) & (ds <= 32))
+        return (r - 1.0) * 12.0 + ds
     return pd.Series(np.nan, index=picks.index)
 
 def filter_drafts(
@@ -677,10 +684,10 @@ def filter_drafts(
         if date_max is not None:
             df = df[df["start_dt"] <= date_max]
 
-    # ✅ TE premium filter only works if leagues were actually loaded
     if te_premium_only and (not leagues.empty) and ("league_id" in df.columns) and ("league_id" in leagues.columns):
-        te_col = "scoring_settings.bonus_rec_te"
-        if te_col in leagues.columns:
+        te_cols = [c for c in leagues.columns if c.endswith("scoring_settings.bonus_rec_te") or c == "scoring_settings.bonus_rec_te"]
+        if te_cols:
+            te_col = te_cols[0]
             lg = leagues[["league_id", te_col]].copy()
             lg[te_col] = pd.to_numeric(lg[te_col], errors="coerce").fillna(0)
             df = df.merge(lg, on="league_id", how="left")
@@ -690,15 +697,28 @@ def filter_drafts(
 
 # ============================================================
 # Rookie logic (STRICT / season-correct) - vectorized
+# KEY FIX: allow years_exp in {0,1} when rookie_year is missing.
 # ============================================================
-def filter_rookies_by_season(df: pd.DataFrame, season: int, keep_rookies: bool) -> pd.DataFrame:
+def _rookie_player_mask(df: pd.DataFrame, season: int) -> pd.Series:
     if df.empty:
-        return df
+        return pd.Series([], dtype=bool)
 
     ry = pd.to_numeric(df.get("rookie_year", np.nan), errors="coerce")
     ye = pd.to_numeric(df.get("years_exp", np.nan), errors="coerce")
 
-    mask = (ry.notna() & (ry.astype("Int64") == int(season))) | (ry.isna() & (ye.fillna(-1).astype("Int64") == 0))
+    # STRICT:
+    # 1) If rookie_year present -> rookie_year == season
+    # 2) If rookie_year missing -> years_exp in {0,1}
+    ry_ok = (ry.notna() & (ry.astype("Int64") == int(season)))
+    ye_ok = (ry.isna() & (ye.fillna(-999).astype("Int64").isin([0, 1])))
+
+    return (ry_ok | ye_ok).fillna(False)
+
+def filter_rookies_by_season(df: pd.DataFrame, season: int, keep_rookies: bool) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    mask = _rookie_player_mask(df, season)
     return df[mask].copy() if keep_rookies else df[~mask].copy()
 
 # ============================================================
@@ -1378,11 +1398,11 @@ with st.sidebar:
     ppg_season = st.number_input("PPG season", 2015, 2030, 2025, 1, disabled=not LOAD_PPG)
 
 # -----------------------------
-# Load drafts (+ leagues ONLY if needed)
+# Load drafts/leagues first (small)
 # -----------------------------
 t0 = _now()
 try:
-    drafts, leagues = load_drafts_leagues(raw_dir, int(season), need_leagues=te_premium_only)
+    drafts, leagues = load_drafts_leagues(raw_dir, int(season))
 except Exception as e:
     _dbg_exception("load_drafts_leagues", e)
     st.stop()
@@ -1456,18 +1476,6 @@ drafts_f = filter_drafts(
     te_premium_only=te_premium_only,
 )
 
-# ✅ Rookie board draft heuristic: ensure we are pulling rookie-style drafts so the board populates
-# Typical rookie drafts are linear and have few rounds (often 4-6). We filter st_rounds accordingly.
-if mode == "adp" and board_kind.startswith("Rookie"):
-    if "type" in drafts_f.columns:
-        drafts_f = drafts_f[drafts_f["type"].isin(["linear"])].copy()
-
-    if "st_rounds" in drafts_f.columns:
-        sr = pd.to_numeric(drafts_f["st_rounds"], errors="coerce")
-        # allow a small buffer above the UI rounds, and cap at 8 to avoid pulling startup/other linear drafts
-        max_rookie_rounds = int(min(8, max(int(num_rounds) + 1, int(num_rounds))))
-        drafts_f = drafts_f[sr.notna() & (sr >= 1) & (sr <= max_rookie_rounds)].copy()
-
 if len(drafts_f) == 0:
     st.warning("No drafts match your filters. Relax filters and try again.")
     st.stop()
@@ -1496,6 +1504,7 @@ if LOAD_PPG:
 drafts_month_map = drafts_f[["draft_id", "start_month"]].copy()
 drafts_month_map["draft_id"] = drafts_month_map["draft_id"].astype("string")
 
+# Rookie pick placeholders (needs filtered picks)
 extra_meta = pd.DataFrame()
 include_positions = ["QB", "RB", "WR", "TE"]
 startup_using_rdp = (mode == "adp" and board_kind.startswith("Startup") and startup_inclusion_mode == "Include rookie picks (K placeholders)")
@@ -1515,6 +1524,7 @@ if startup_using_rdp:
         extra_meta = rp_meta.copy()
     include_positions = ["QB", "RB", "WR", "TE", "RDP"]
 
+# Build pool
 if mode == "auction":
     pool = compute_player_auction_stats(
         picks=picks_for_pool,
@@ -1547,32 +1557,43 @@ if pool.empty:
 
 pool_for_board = pool.copy()
 
-# ✅ Rookie ADP board = rookies (players) ONLY (never RDP placeholders)
+# ============================================================
+# Rookie filtering (FIXED)
+# - Rookie board: rookies (players) ONLY, NEVER placeholders
+# - Startup: options behave as described
+# ============================================================
+pool_for_board["position"] = pool_for_board["position"].map(normalize_pos)
+is_rdp_placeholder = (
+    pool_for_board.get("is_rookie_pick", pd.Series(False, index=pool_for_board.index))
+    .astype(bool)
+    .fillna(False)
+    | (pool_for_board["position"] == "RDP")
+    | (pool_for_board["player_id"].astype("string").str.startswith("ROOKIE_PICK_", na=False))
+)
+
 if mode == "adp" and board_kind.startswith("Rookie"):
-    if "is_rookie_pick" in pool_for_board.columns:
-        pool_for_board = pool_for_board[~pool_for_board["is_rookie_pick"].astype(bool)].copy()
-    pool_for_board = pool_for_board[pool_for_board["position"].map(normalize_pos).isin(["QB", "RB", "WR", "TE"])].copy()
+    # IMPORTANT: rookie board should never show RDP placeholders
+    pool_for_board = pool_for_board[~is_rdp_placeholder].copy()
     pool_for_board = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=True)
     if pool_for_board.empty:
-        st.warning("No rookie-eligible players found for this season in the filtered rookie drafts.")
+        st.warning("No rookie-eligible players after filtering (rookie_year==season OR years_exp in {0,1} when rookie_year missing).")
         st.stop()
 
-# Startup inclusion rules
 if mode == "adp" and board_kind.startswith("Startup"):
     if startup_inclusion_mode == "Exclude rookies and rookie picks":
         pool_for_board = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=False)
-        if "is_rookie_pick" in pool_for_board.columns:
-            pool_for_board = pool_for_board[~pool_for_board["is_rookie_pick"].astype(bool)].copy()
+        pool_for_board = pool_for_board[~is_rdp_placeholder.reindex(pool_for_board.index, fill_value=False)].copy()
 
-    # ✅ If using rookie pick placeholders: exclude rookie PLAYERS, keep RDP placeholders
+    # If using rookie picks placeholders, exclude rookie PLAYERS (but keep the RDP placeholders)
     if startup_using_rdp:
-        keep_rdp = pool_for_board.get("is_rookie_pick", pd.Series(False, index=pool_for_board.index)).astype(bool).fillna(False)
+        keep_rdp = is_rdp_placeholder.reindex(pool_for_board.index, fill_value=False)
         non_rookies = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=False)
         pool_for_board = pd.concat([non_rookies, pool_for_board[keep_rdp]], ignore_index=True)
         pool_for_board = pool_for_board.drop_duplicates(subset=["player_id"], keep="first")
 
 pool_for_board["position"] = pool_for_board["position"].map(normalize_pos)
 
+# Pos ranks + mapping
 if mode == "auction":
     pool_for_board["avg_price"] = pd.to_numeric(pool_for_board["avg_price"], errors="coerce")
     pool_for_board = pool_for_board.sort_values(["position", "avg_price"], ascending=[True, False]).reset_index(drop=True)
@@ -1678,23 +1699,28 @@ render_board_clickable_tiles(mapping, int(num_teams), int(num_rounds), title_lin
 if DEBUG:
     st.divider()
     st.markdown("### 🧪 DEBUG: Memory + timings")
+
+    # helpful rookie sanity counts
+    rookie_mask_all = _rookie_player_mask(pool_for_board, int(season)) if (mode == "adp" and ("rookie_year" in pool_for_board.columns or "years_exp" in pool_for_board.columns)) else None
+    rookie_count_all = int(rookie_mask_all.sum()) if rookie_mask_all is not None and len(rookie_mask_all) else None
+
     st.write(
         {
             "rss_mb (best-effort)": _get_rss_mb(),
             "load_drafts_leagues_time": _fmt_secs(t1 - t0),
             "drafts_shape": drafts.shape,
             "drafts_mem_mb": round(_df_mem_mb(drafts), 2),
-            "leagues_loaded": (not leagues.empty),
             "leagues_shape": leagues.shape,
             "leagues_mem_mb": round(_df_mem_mb(leagues), 2),
-            "players_shape": players_df.shape,
-            "players_mem_mb": round(_df_mem_mb(players_df), 2),
+            "players_shape": players_df.shape if isinstance(players_df, pd.DataFrame) else None,
+            "players_mem_mb": round(_df_mem_mb(players_df), 2) if isinstance(players_df, pd.DataFrame) else None,
             "drafts_f_rows": int(len(drafts_f)),
             "draft_ids_count": int(len(draft_ids)),
             "picks_f_shape": picks_f.shape,
             "picks_f_mem_mb": round(_df_mem_mb(picks_f), 2),
             "pool_rows": int(len(pool_for_board)),
             "pool_mem_mb": round(_df_mem_mb(pool_for_board), 2),
+            "rookie_count_in_pool_for_board": rookie_count_all,
             "build_time": _fmt_secs(build_t1 - build_t0),
             "LOAD_PPG": LOAD_PPG,
         }
