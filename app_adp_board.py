@@ -20,12 +20,20 @@
 # ✅ Add back month-to-month trend graph (ADP or Avg$) for selected player
 # ✅ Export: download CSV (long-form list) for current selected board (all filters)
 #
+# MEMORY REDUCTION (2026-02-09):
+# ✅ Use pyarrow.dataset filter pushdown to load ONLY picks for filtered draft_ids
+# ✅ Aggregate picks FIRST (small), then merge players metadata
+# ✅ Cheap parquet schema reads (pq.ParquetFile)
+# ✅ Vectorized rookie filter (no axis=1 apply)
+# ✅ Reduce copies + smaller dtypes where safe + gc.collect after build
+#
 # ============================================================
 
 import os
 import time
 import warnings
 import traceback
+import gc
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,6 +42,10 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 
 warnings.filterwarnings(
     "ignore",
@@ -452,13 +464,14 @@ def load_drafts_leagues(raw_dir: str, season: int) -> Tuple[pd.DataFrame, pd.Dat
         "md_scoring_type", "st_teams", "st_rounds",
         "start_time", "created",
     ]
-    meta_all = pd.read_parquet(drafts_path, engine="pyarrow", columns=None).columns
+    # Cheap schema read (no full parquet scan)
+    meta_all = pq.ParquetFile(drafts_path).schema.names
     drafts_cols = [c for c in drafts_cols if c in meta_all]
 
     drafts = pd.read_parquet(drafts_path, engine="pyarrow", columns=drafts_cols)
     for col in ["draft_id", "league_id"]:
         if col in drafts.columns:
-            drafts[col] = drafts[col].astype(str)
+            drafts[col] = drafts[col].astype("string")
 
     drafts = add_time_columns(drafts)
 
@@ -466,11 +479,17 @@ def load_drafts_leagues(raw_dir: str, season: int) -> Tuple[pd.DataFrame, pd.Dat
     if os.path.exists(leagues_path):
         leagues = pd.read_parquet(leagues_path, engine="pyarrow")
         if "league_id" in leagues.columns:
-            leagues["league_id"] = leagues["league_id"].astype(str)
+            leagues["league_id"] = leagues["league_id"].astype("string")
 
     return drafts, leagues
 
 def load_picks_for_draft_ids(raw_dir: str, season: int, draft_ids: List[str]) -> pd.DataFrame:
+    """
+    Memory-safe picks load:
+    - Uses pyarrow.dataset filter pushdown to read only matching draft_ids
+    - Reads only required columns
+    - Converts to pandas at the end
+    """
     _drafts_path, picks_path, _leagues_path = season_raw_paths(raw_dir, season)
     if not os.path.exists(picks_path):
         raise FileNotFoundError(f"Missing RAW picks parquet:\n{picks_path}")
@@ -482,22 +501,31 @@ def load_picks_for_draft_ids(raw_dir: str, season: int, draft_ids: List[str]) ->
         "md_amount",
     ]
 
-    meta_cols = pd.read_parquet(picks_path, engine="pyarrow", columns=None).columns
-    cols = [c for c in want if c in meta_cols]
+    schema_names = pq.ParquetFile(picks_path).schema.names
+    cols = [c for c in want if c in schema_names]
     if "draft_id" not in cols or "player_id" not in cols:
-        raise RuntimeError(f"picks parquet missing required columns. Found columns: {list(meta_cols)[:50]} ...")
+        raise RuntimeError(
+            f"picks parquet missing required columns. Found columns: {schema_names[:50]} ..."
+        )
 
-    picks = pd.read_parquet(picks_path, engine="pyarrow", columns=cols)
+    dids = [str(x) for x in draft_ids]
+    if len(dids) == 0:
+        return pd.DataFrame(columns=cols)
 
-    picks["draft_id"] = picks["draft_id"].astype(str)
-    picks["player_id"] = picks["player_id"].astype(str)
+    dataset = ds.dataset(picks_path, format="parquet")
+    filt = ds.field("draft_id").isin(dids)
+    table = dataset.to_table(columns=cols, filter=filt)
 
-    did_set = set(map(str, draft_ids))
-    picks = picks[picks["draft_id"].isin(did_set)].copy()
+    # Arrow-backed dtypes where possible to reduce memory
+    picks = table.to_pandas(types_mapper=pd.ArrowDtype)
 
-    for c in ["round", "draft_slot", "pick_no", "overall_pick", "pick", "draft_pick", "pick_number", "md_amount"]:
+    picks["draft_id"] = picks["draft_id"].astype("string")
+    picks["player_id"] = picks["player_id"].astype("string")
+
+    num_cols = ["round", "draft_slot", "pick_no", "overall_pick", "pick", "draft_pick", "pick_number", "md_amount"]
+    for c in num_cols:
         if c in picks.columns:
-            picks[c] = pd.to_numeric(picks[c], errors="coerce")
+            picks[c] = pd.to_numeric(picks[c], errors="coerce").astype("float32")
 
     return picks
 
@@ -520,16 +548,16 @@ def load_players_df() -> pd.DataFrame:
     else:
         players_raw["player_id"] = players_raw["sleeper_player_id"]
 
-    players_raw["player_id"] = players_raw["player_id"].astype(str)
+    players_raw["player_id"] = players_raw["player_id"].astype("string")
 
     want = ["player_id", "full_name", "position", "team", "years_exp", "rookie_year", "status"]
     have = [c for c in want if c in players_raw.columns]
     df = players_raw[have].copy()
 
     if "years_exp" in df.columns:
-        df["years_exp"] = pd.to_numeric(df["years_exp"], errors="coerce")
+        df["years_exp"] = pd.to_numeric(df["years_exp"], errors="coerce").astype("float32")
     if "rookie_year" in df.columns:
-        df["rookie_year"] = pd.to_numeric(df["rookie_year"], errors="coerce")
+        df["rookie_year"] = pd.to_numeric(df["rookie_year"], errors="coerce").astype("float32")
     if "position" in df.columns:
         df["position"] = df["position"].map(normalize_pos)
 
@@ -571,10 +599,10 @@ def load_ppg(season: int) -> pd.DataFrame:
         return pd.DataFrame(columns=["player_id", "ppg", "games_played", "fantasy_pts"])
 
     stats_df = pd.DataFrame.from_dict(data, orient="index").reset_index().rename(columns={"index": "player_id"})
-    stats_df["player_id"] = stats_df["player_id"].astype(str)
+    stats_df["player_id"] = stats_df["player_id"].astype("string")
 
     players_df = load_players_df().copy()
-    players_df["player_id"] = players_df["player_id"].astype(str)
+    players_df["player_id"] = players_df["player_id"].astype("string")
 
     merged = players_df.merge(stats_df, on="player_id", how="left")
     merged["fantasy_pts"] = calc_fantasy_points(merged, SCORING)
@@ -627,33 +655,36 @@ def filter_drafts(
     date_max: Optional[pd.Timestamp],
     te_premium_only: bool,
 ) -> pd.DataFrame:
-    df = drafts.copy()
+    # Avoid initial copy; copy once at return
+    df = drafts
 
     if "season" in df.columns:
-        df = df[pd.to_numeric(df["season"], errors="coerce") == season].copy()
+        df = df[pd.to_numeric(df["season"], errors="coerce") == season]
     if "draft_status" in df.columns and draft_status:
-        df = df[df["draft_status"].isin(draft_status)].copy()
+        df = df[df["draft_status"].isin(draft_status)]
     if "type" in df.columns and draft_type:
-        df = df[df["type"].isin(draft_type)].copy()
+        df = df[df["type"].isin(draft_type)]
     if "md_scoring_type" in df.columns and scoring_types:
-        df = df[df["md_scoring_type"].isin(scoring_types)].copy()
+        df = df[df["md_scoring_type"].isin(scoring_types)]
 
     if "st_teams" in df.columns and league_sizes:
+        df = df.copy()
         df["st_teams"] = pd.to_numeric(df["st_teams"], errors="coerce")
-        df = df[df["st_teams"].isin(league_sizes)].copy()
+        df = df[df["st_teams"].isin(league_sizes)]
 
     if "st_rounds" in df.columns:
+        df = df.copy()
         df["st_rounds"] = pd.to_numeric(df["st_rounds"], errors="coerce")
         if min_rounds is not None:
-            df = df[df["st_rounds"] >= min_rounds].copy()
+            df = df[df["st_rounds"] >= min_rounds]
         if max_rounds is not None:
-            df = df[df["st_rounds"] <= max_rounds].copy()
+            df = df[df["st_rounds"] <= max_rounds]
 
     if "start_dt" in df.columns:
         if date_min is not None:
-            df = df[df["start_dt"] >= date_min].copy()
+            df = df[df["start_dt"] >= date_min]
         if date_max is not None:
-            df = df[df["start_dt"] <= date_max].copy()
+            df = df[df["start_dt"] <= date_max]
 
     if te_premium_only and (not leagues.empty) and ("league_id" in df.columns) and ("league_id" in leagues.columns):
         te_cols = [c for c in leagues.columns if c.endswith("scoring_settings.bonus_rec_te") or c == "scoring_settings.bonus_rec_te"]
@@ -662,39 +693,25 @@ def filter_drafts(
             lg = leagues[["league_id", te_col]].copy()
             lg[te_col] = pd.to_numeric(lg[te_col], errors="coerce").fillna(0)
             df = df.merge(lg, on="league_id", how="left")
-            df = df[pd.to_numeric(df[te_col], errors="coerce").fillna(0) > 0].copy()
+            df = df[pd.to_numeric(df[te_col], errors="coerce").fillna(0) > 0]
 
-    return df
+    return df.copy()
 
 # ============================================================
-# Rookie logic (STRICT / season-correct)
+# Rookie logic (STRICT / season-correct) - vectorized
 # ============================================================
-def is_rookie_for_season_row(row: pd.Series, season: int) -> bool:
-    """
-    STRICT rookie eligibility by season:
-    - If rookie_year exists: rookie_year == season
-    - Else: years_exp == 0 (true rookie)
-    """
-    ry = row.get("rookie_year", np.nan)
-    if pd.notna(ry):
-        try:
-            return int(ry) == int(season)
-        except Exception:
-            pass
-
-    ye = row.get("years_exp", np.nan)
-    if pd.notna(ye):
-        try:
-            return int(ye) == 0
-        except Exception:
-            pass
-
-    return False
-
 def filter_rookies_by_season(df: pd.DataFrame, season: int, keep_rookies: bool) -> pd.DataFrame:
     if df.empty:
         return df
-    mask = df.apply(lambda r: is_rookie_for_season_row(r, season), axis=1)
+
+    ry = pd.to_numeric(df.get("rookie_year", np.nan), errors="coerce")
+    ye = pd.to_numeric(df.get("years_exp", np.nan), errors="coerce")
+
+    # STRICT:
+    # if rookie_year present -> rookie_year == season
+    # else years_exp == 0
+    mask = (ry.notna() & (ry.astype("Int64") == int(season))) | (ry.isna() & (ye.fillna(-1).astype("Int64") == 0))
+
     return df[mask].copy() if keep_rookies else df[~mask].copy()
 
 # ============================================================
@@ -710,12 +727,12 @@ def build_rookie_pick_placeholders(
         return pd.DataFrame(), pd.DataFrame()
 
     dmini = drafts_filtered[["draft_id", "st_teams"]].copy()
-    dmini["draft_id"] = dmini["draft_id"].astype(str)
+    dmini["draft_id"] = dmini["draft_id"].astype("string")
     dmini["st_teams"] = pd.to_numeric(dmini["st_teams"], errors="coerce")
 
     p = picks.copy()
-    p["draft_id"] = p["draft_id"].astype(str)
-    p["player_id"] = p["player_id"].astype(str)
+    p["draft_id"] = p["draft_id"].astype("string")
+    p["player_id"] = p["player_id"].astype("string")
 
     p = p.merge(dmini, on="draft_id", how="left")
     p["pick_no_calc"] = infer_pick_no(p)
@@ -723,7 +740,7 @@ def build_rookie_pick_placeholders(
     p = p[p["pick_no_calc"].notna()].copy()
 
     pl = players_df[["player_id", "position"]].copy()
-    pl["player_id"] = pl["player_id"].astype(str)
+    pl["player_id"] = pl["player_id"].astype("string")
     p = p.merge(pl, on="player_id", how="left")
 
     st_teams = pd.to_numeric(p["st_teams"], errors="coerce").fillna(12)
@@ -755,7 +772,7 @@ def build_rookie_pick_placeholders(
     pk["_rp_name"] = "Rookie Pick " + pk["_rp_label"].astype(str)
 
     picks_rp = pk.copy()
-    picks_rp["player_id"] = picks_rp["_rp_id"].astype(str)
+    picks_rp["player_id"] = picks_rp["_rp_id"].astype("string")
 
     rp_meta = (
         picks_rp[["player_id", "_rp_name"]]
@@ -771,7 +788,7 @@ def build_rookie_pick_placeholders(
     return picks_rp, rp_meta
 
 # ============================================================
-# Pool builders
+# Pool builders (aggregate first, then merge meta)
 # ============================================================
 def compute_player_pick_stats(
     picks: pd.DataFrame,
@@ -780,90 +797,98 @@ def compute_player_pick_stats(
     include_positions: Optional[List[str]] = None,
     extra_meta: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    p = picks.copy()
-    if "draft_id" not in p.columns or "player_id" not in p.columns:
-        raise RuntimeError("picks must include at least: draft_id, player_id")
-
-    p["draft_id"] = p["draft_id"].astype(str)
-    p["player_id"] = p["player_id"].astype(str)
-
-    p["pick_no_calc"] = infer_pick_no(p)
-    p["pick_no_calc"] = pd.to_numeric(p["pick_no_calc"], errors="coerce")
-    p = p[p["pick_no_calc"].notna()].copy()
-
-    pl = players_df.copy()
-    pl["player_id"] = pl["player_id"].astype(str)
-
-    for c in ["rookie_year", "years_exp", "full_name", "team", "position"]:
-        if c not in pl.columns:
-            pl[c] = np.nan if c in ["rookie_year", "years_exp"] else ""
-    pl["position"] = pl["position"].map(normalize_pos)
-
-    df = p.merge(pl, on="player_id", how="left")
-    df["is_rookie_pick"] = pd.Series(False, index=df.index, dtype="boolean")
-
-    if extra_meta is not None and not extra_meta.empty:
-        em = extra_meta.copy()
-        em["player_id"] = em["player_id"].astype(str)
-        for c in ["full_name", "team", "position", "years_exp", "rookie_year", "is_rookie_pick"]:
-            if c not in em.columns:
-                em[c] = np.nan
-
-        df = df.merge(
-            em[["player_id", "full_name", "team", "position", "years_exp", "rookie_year", "is_rookie_pick"]],
-            on="player_id",
-            how="left",
-            suffixes=("", "_extra"),
-        )
-
-        for col in ["full_name", "team", "position", "years_exp", "rookie_year"]:
-            extra_col = f"{col}_extra"
-            if extra_col in df.columns:
-                df[col] = df[col].where(df[col].notna(), df[extra_col])
-                df = df.drop(columns=[extra_col])
-
-        if "is_rookie_pick_extra" in df.columns:
-            df["is_rookie_pick"] = (
-                df["is_rookie_pick_extra"].astype("boolean").fillna(False)
-                | df["is_rookie_pick"].astype("boolean").fillna(False)
-            )
-            df = df.drop(columns=["is_rookie_pick_extra"])
+    if picks.empty:
+        return pd.DataFrame()
 
     if include_positions is None:
         include_positions = ["QB", "RB", "WR", "TE"]
 
-    df["position"] = df["position"].map(normalize_pos)
-    allowed = [normalize_pos(x) for x in include_positions]
-    df = df[df["position"].isin(allowed)].copy()
+    # Minimal series
+    pid = picks["player_id"].astype("string") if "player_id" in picks.columns else pd.Series([], dtype="string")
+    did = picks["draft_id"].astype("string") if "draft_id" in picks.columns else pd.Series([], dtype="string")
 
-    out = (
-        df.groupby("player_id", as_index=False)
+    pno = infer_pick_no(picks)
+    pno = pd.to_numeric(pno, errors="coerce")
+    ok = pno.notna()
+    if not ok.any():
+        return pd.DataFrame()
+
+    tmp = pd.DataFrame(
+        {
+            "player_id": pid[ok].to_numpy(),
+            "draft_id": did[ok].to_numpy(),
+            "pick_no_calc": pno[ok].to_numpy(dtype="float32"),
+        }
+    )
+
+    agg = (
+        tmp.groupby("player_id", as_index=False)
         .agg(
             picks=("pick_no_calc", "size"),
             drafts=("draft_id", pd.Series.nunique),
             adp=("pick_no_calc", "mean"),
             min_pick=("pick_no_calc", "min"),
             max_pick=("pick_no_calc", "max"),
-            full_name=("full_name", "first"),
-            team=("team", "first"),
-            position=("position", "first"),
-            years_exp=("years_exp", "first"),
-            rookie_year=("rookie_year", "first"),
-            is_rookie_pick=("is_rookie_pick", "first"),
         )
     )
+    agg = agg[agg["drafts"] > 0].copy()
 
+    # Player meta (small)
+    pl_cols = [c for c in ["player_id", "full_name", "team", "position", "years_exp", "rookie_year"] if c in players_df.columns]
+    pl = players_df[pl_cols].copy()
+    pl["player_id"] = pl["player_id"].astype("string")
+
+    for c in ["full_name", "team", "position"]:
+        if c not in pl.columns:
+            pl[c] = ""
+    for c in ["years_exp", "rookie_year"]:
+        if c not in pl.columns:
+            pl[c] = np.nan
+
+    pl["position"] = pl["position"].map(normalize_pos)
+
+    out = agg.merge(pl, on="player_id", how="left")
+    out["is_rookie_pick"] = False
+
+    # Extra meta for placeholders
+    if extra_meta is not None and not extra_meta.empty:
+        em_cols = [c for c in ["player_id", "full_name", "team", "position", "years_exp", "rookie_year", "is_rookie_pick"] if c in extra_meta.columns]
+        em = extra_meta[em_cols].copy()
+        em["player_id"] = em["player_id"].astype("string")
+
+        out = out.merge(em, on="player_id", how="left", suffixes=("", "_extra"))
+
+        for col in ["full_name", "team", "position", "years_exp", "rookie_year"]:
+            ec = f"{col}_extra"
+            if ec in out.columns:
+                out[col] = out[col].where(out[col].notna(), out[ec])
+                out.drop(columns=[ec], inplace=True)
+
+        if "is_rookie_pick_extra" in out.columns:
+            out["is_rookie_pick"] = (
+                out["is_rookie_pick_extra"].astype("boolean").fillna(False)
+                | out["is_rookie_pick"].astype("boolean").fillna(False)
+            )
+            out.drop(columns=["is_rookie_pick_extra"], inplace=True)
+
+    # Position filtering on small out
+    allowed = [normalize_pos(x) for x in include_positions]
+    out["position"] = out["position"].map(normalize_pos)
+    out = out[out["position"].isin(allowed)].copy()
+
+    # Add PPG (small merge)
     if ppg_df is not None and not ppg_df.empty:
         out = out.merge(ppg_df[["player_id", "ppg", "games_played", "fantasy_pts"]], on="player_id", how="left")
 
-    out["adp"] = pd.to_numeric(out["adp"], errors="coerce").round(2)
-    out["min_pick"] = pd.to_numeric(out["min_pick"], errors="coerce")
-    out["max_pick"] = pd.to_numeric(out["max_pick"], errors="coerce")
-    out["picks"] = pd.to_numeric(out["picks"], errors="coerce").fillna(0).astype(int)
-    out["drafts"] = pd.to_numeric(out["drafts"], errors="coerce").fillna(0).astype(int)
-    out["rookie_year"] = pd.to_numeric(out["rookie_year"], errors="coerce")
+    # Dtypes + rounding
+    out["adp"] = pd.to_numeric(out["adp"], errors="coerce").astype("float32").round(2)
+    out["min_pick"] = pd.to_numeric(out["min_pick"], errors="coerce").astype("float32")
+    out["max_pick"] = pd.to_numeric(out["max_pick"], errors="coerce").astype("float32")
+    out["picks"] = pd.to_numeric(out["picks"], errors="coerce").fillna(0).astype("int32")
+    out["drafts"] = pd.to_numeric(out["drafts"], errors="coerce").fillna(0).astype("int32")
+    out["rookie_year"] = pd.to_numeric(out.get("rookie_year", np.nan), errors="coerce").astype("float32")
+    out["years_exp"] = pd.to_numeric(out.get("years_exp", np.nan), errors="coerce").astype("float32")
 
-    out = out[out["drafts"] > 0].copy()
     out = out.sort_values("adp").reset_index(drop=True)
     return out
 
@@ -873,35 +898,27 @@ def compute_player_auction_stats(
     ppg_df: Optional[pd.DataFrame] = None,
     include_positions: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    p = picks.copy()
-    if "draft_id" not in p.columns or "player_id" not in p.columns:
-        raise RuntimeError("picks must include at least: draft_id, player_id")
-
-    if "md_amount" not in p.columns:
+    if picks.empty or "md_amount" not in picks.columns:
         return pd.DataFrame()
-
-    p["draft_id"] = p["draft_id"].astype(str)
-    p["player_id"] = p["player_id"].astype(str)
-    p["amount"] = pd.to_numeric(p["md_amount"], errors="coerce")
-    p = p[p["amount"].notna()].copy()
-
-    pl = players_df.copy()
-    pl["player_id"] = pl["player_id"].astype(str)
-    for c in ["rookie_year", "years_exp", "full_name", "team", "position"]:
-        if c not in pl.columns:
-            pl[c] = np.nan if c in ["rookie_year", "years_exp"] else ""
-    pl["position"] = pl["position"].map(normalize_pos)
-
-    df = p.merge(pl, on="player_id", how="left")
 
     if include_positions is None:
         include_positions = ["QB", "RB", "WR", "TE"]
-    df["position"] = df["position"].map(normalize_pos)
-    allowed = [normalize_pos(x) for x in include_positions]
-    df = df[df["position"].isin(allowed)].copy()
 
-    out = (
-        df.groupby("player_id", as_index=False)
+    amount = pd.to_numeric(picks["md_amount"], errors="coerce")
+    ok = amount.notna()
+    if not ok.any():
+        return pd.DataFrame()
+
+    tmp = pd.DataFrame(
+        {
+            "player_id": picks["player_id"].astype("string")[ok].to_numpy(),
+            "draft_id": picks["draft_id"].astype("string")[ok].to_numpy(),
+            "amount": amount[ok].to_numpy(dtype="float32"),
+        }
+    )
+
+    agg = (
+        tmp.groupby("player_id", as_index=False)
         .agg(
             sales=("amount", "size"),
             drafts=("draft_id", pd.Series.nunique),
@@ -909,25 +926,40 @@ def compute_player_auction_stats(
             med_price=("amount", "median"),
             min_price=("amount", "min"),
             max_price=("amount", "max"),
-            full_name=("full_name", "first"),
-            team=("team", "first"),
-            position=("position", "first"),
-            years_exp=("years_exp", "first"),
-            rookie_year=("rookie_year", "first"),
         )
     )
+    agg = agg[agg["drafts"] > 0].copy()
 
-    for c in ["avg_price", "med_price", "min_price", "max_price"]:
-        out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
+    pl_cols = [c for c in ["player_id", "full_name", "team", "position", "years_exp", "rookie_year"] if c in players_df.columns]
+    pl = players_df[pl_cols].copy()
+    pl["player_id"] = pl["player_id"].astype("string")
 
-    out["sales"] = pd.to_numeric(out["sales"], errors="coerce").fillna(0).astype(int)
-    out["drafts"] = pd.to_numeric(out["drafts"], errors="coerce").fillna(0).astype(int)
-    out["rookie_year"] = pd.to_numeric(out["rookie_year"], errors="coerce")
+    for c in ["full_name", "team", "position"]:
+        if c not in pl.columns:
+            pl[c] = ""
+    for c in ["years_exp", "rookie_year"]:
+        if c not in pl.columns:
+            pl[c] = np.nan
+
+    pl["position"] = pl["position"].map(normalize_pos)
+
+    out = agg.merge(pl, on="player_id", how="left")
+
+    allowed = [normalize_pos(x) for x in include_positions]
+    out["position"] = out["position"].map(normalize_pos)
+    out = out[out["position"].isin(allowed)].copy()
 
     if ppg_df is not None and not ppg_df.empty:
         out = out.merge(ppg_df[["player_id", "ppg", "games_played", "fantasy_pts"]], on="player_id", how="left")
 
-    out = out[out["drafts"] > 0].copy()
+    for c in ["avg_price", "med_price", "min_price", "max_price"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").astype("float32").round(2)
+
+    out["sales"] = pd.to_numeric(out["sales"], errors="coerce").fillna(0).astype("int32")
+    out["drafts"] = pd.to_numeric(out["drafts"], errors="coerce").fillna(0).astype("int32")
+    out["rookie_year"] = pd.to_numeric(out.get("rookie_year", np.nan), errors="coerce").astype("float32")
+    out["years_exp"] = pd.to_numeric(out.get("years_exp", np.nan), errors="coerce").astype("float32")
+
     out = out.sort_values(["avg_price", "drafts"], ascending=[False, False]).reset_index(drop=True)
     return out
 
@@ -1080,9 +1112,9 @@ def show_player_dialog(
             st.info("No trend data available for this selection in the current filtered draft set.")
         else:
             dm = drafts_month_map.copy()
-            dm["draft_id"] = dm["draft_id"].astype(str)
+            dm["draft_id"] = dm["draft_id"].astype("string")
             psub = picks_subset.copy()
-            psub["draft_id"] = psub["draft_id"].astype(str)
+            psub["draft_id"] = psub["draft_id"].astype("string")
 
             if mode == "auction":
                 if "amount" not in psub.columns and "md_amount" in psub.columns:
@@ -1461,7 +1493,7 @@ if len(drafts_f) == 0:
 months_in_scope = sorted([m for m in drafts_f.get("start_month", pd.Series([], dtype="string")).dropna().unique().tolist()])
 required_player_drafts = int(min_drafts_per_month) * max(len(months_in_scope), 1)
 
-draft_ids = drafts_f["draft_id"].astype(str).unique().tolist()
+draft_ids = drafts_f["draft_id"].astype("string").unique().tolist()
 
 try:
     picks_f = load_picks_for_draft_ids(raw_dir, int(season), draft_ids)
@@ -1481,14 +1513,15 @@ if LOAD_PPG:
 
 # For month-to-month trend in dialog
 drafts_month_map = drafts_f[["draft_id", "start_month"]].copy()
-drafts_month_map["draft_id"] = drafts_month_map["draft_id"].astype(str)
+drafts_month_map["draft_id"] = drafts_month_map["draft_id"].astype("string")
 
 # Rookie pick placeholders (needs filtered picks)
 extra_meta = pd.DataFrame()
-picks_for_pool = picks_f
-
 include_positions = ["QB", "RB", "WR", "TE"]
 startup_using_rdp = (mode == "adp" and board_kind.startswith("Startup") and startup_inclusion_mode == "Include rookie picks (K placeholders)")
+
+# Only create combined picks if we actually have placeholder picks to append
+picks_for_pool = picks_f
 
 if startup_using_rdp:
     rp_picks, rp_meta = build_rookie_pick_placeholders(
@@ -1498,8 +1531,8 @@ if startup_using_rdp:
         early_rounds=int(kicker_placeholder_rounds),
     )
     if not rp_picks.empty:
-        common_cols = [c for c in picks_for_pool.columns if c in rp_picks.columns]
-        picks_for_pool = pd.concat([picks_for_pool, rp_picks[common_cols]], ignore_index=True)
+        common_cols = [c for c in picks_f.columns if c in rp_picks.columns]
+        picks_for_pool = pd.concat([picks_f[common_cols], rp_picks[common_cols]], ignore_index=True)
         extra_meta = rp_meta.copy()
     include_positions = ["QB", "RB", "WR", "TE", "RDP"]
 
@@ -1552,11 +1585,7 @@ if mode == "adp" and board_kind.startswith("Startup"):
 
     # ✅ If using rookie picks placeholders, exclude rookie PLAYERS (but keep the RDP placeholders)
     if startup_using_rdp:
-        if "is_rookie_pick" in pool_for_board.columns:
-            keep_rdp = pool_for_board["is_rookie_pick"].astype(bool).fillna(False)
-        else:
-            keep_rdp = pd.Series(False, index=pool_for_board.index)
-
+        keep_rdp = pool_for_board.get("is_rookie_pick", pd.Series(False, index=pool_for_board.index)).astype(bool).fillna(False)
         non_rookies = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=False)
 
         # Re-add RDP rows (placeholders)
@@ -1581,6 +1610,13 @@ else:
         mapping = build_board_map_linear_by_col(pool_for_board, int(num_teams), int(num_rounds), sort_col="adp", asc=True)
 
 build_t1 = _now()
+
+# Free some build-time memory
+try:
+    del pool
+except Exception:
+    pass
+gc.collect()
 
 # Summary metrics
 m1, m2, m3 = st.columns(3)
@@ -1646,6 +1682,9 @@ with st.expander("📤 Export current board (long-form list)", expanded=False):
     )
     st.caption("Reflects all current filters and the selected board type.")
 
+    del export_df
+    gc.collect()
+
 # Render board
 if mode == "auction":
     st.subheader("Auction Price Board")
@@ -1689,14 +1728,21 @@ if DEBUG:
 pid = st.session_state.get("selected_pid", None)
 if pid and st.session_state.get("dialog_open", False):
     try:
-        sel = pool_for_board[pool_for_board["player_id"].astype(str) == str(pid)].head(1)
+        sel = pool_for_board[pool_for_board["player_id"].astype("string") == str(pid)].head(1)
         if sel.empty:
             st.warning("Selected entity is not in the current pool (filters may have changed). Click another square.")
             close_player_dialog()
         else:
             sel_row = sel.iloc[0]
 
-            p_sub = picks_f[picks_f["player_id"].astype(str) == str(pid)].copy()
+            pid_s = str(pid)
+            p_sub = picks_f.loc[picks_f["player_id"].astype("string") == pid_s, :]
+
+            # Keep dialog slice narrow (memory + speed)
+            keep_cols = ["draft_id", "player_id", "md_amount", "pick_no", "overall_pick", "pick", "draft_pick", "pick_number", "round", "draft_slot"]
+            keep_cols = [c for c in keep_cols if c in p_sub.columns]
+            p_sub = p_sub[keep_cols].copy()
+
             if mode == "auction":
                 if "md_amount" in p_sub.columns:
                     p_sub["amount"] = pd.to_numeric(p_sub["md_amount"], errors="coerce")
