@@ -8,10 +8,17 @@
 # - Do NOT cache big picks DataFrames in st.cache_data or st.session_state.
 # - Make PPG optional (OFF by default) to avoid large API payloads.
 #
-# FIXES (2026-02-09):
-# 1) Rookie boards blank -> make rookie eligibility robust (rookie_year in {season, season-1} OR years_exp <= 1)
-# 2) Wide board readability -> card bottom shows Rank+Team AND ADP/Avg$ + drafts (two meta rows)
-# 3) Export -> download CSV for current selected board (long-form list) reflecting all filters
+# FIXES (2026-02-09 + follow-ups):
+# 1) Rookie eligibility correct across ALL seasons (no "season-1" hacks). Uses:
+#    - rookie_year when available
+#    - else estimates rookie_year from years_exp relative to CURRENT_SEASON_YEAR
+# 2) "Include rookie picks (K placeholders)" must NOT include rookie players
+# 3) Cards: do NOT show ADP/drafts; show slot label (e.g., 1.07 / 3.02) like before
+#    + show player name overlay at top of card
+# 4) Export: download CSV for current selected board (long-form list) reflecting all filters
+# 5) Add back month-to-month trend graph in the player dialog:
+#    - ADP mode: monthly avg pick_no_calc (ADP) line
+#    - Auction mode: monthly avg amount line
 #
 # ============================================================
 
@@ -171,8 +178,22 @@ APP_CSS = """
   .card-top:after {
     content: "";
     position: absolute; inset: 0;
-    background: linear-gradient(to bottom, rgba(0,0,0,0.05), rgba(0,0,0,0.40));
+    background: linear-gradient(to bottom, rgba(0,0,0,0.05), rgba(0,0,0,0.45));
     pointer-events: none;
+  }
+
+  /* name overlay at top of card */
+  .card-name-top{
+    position:absolute;
+    left:8px; right:8px; top:6px;
+    font-size:11px;
+    font-weight:900;
+    color: rgba(255,255,255,0.96);
+    text-shadow: 0 1px 10px rgba(0,0,0,0.55);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    z-index: 2;
   }
 
   .rp-top {
@@ -181,6 +202,7 @@ APP_CSS = """
     display: flex; align-items: center; justify-content: center;
     font-size: 26px;
     color: rgba(255,255,255,0.92);
+    position: relative;
   }
 
   .card-bottom {
@@ -202,7 +224,7 @@ APP_CSS = """
     color: rgba(255,255,255,0.95);
     text-shadow: 0 1px 10px rgba(0,0,0,0.45);
   }
-  .meta, .meta2 {
+  .meta {
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -243,6 +265,9 @@ st.markdown(APP_CSS, unsafe_allow_html=True)
 BASE = "https://api.sleeper.app/v1"
 session = requests.Session()
 session.headers.update({"User-Agent": "Sleeper-Dynasty-ADP/1.0"})
+
+# "years_exp" is relative to the *current* season. We use this for historical season rookie-eligibility.
+CURRENT_SEASON_YEAR = datetime.utcnow().year
 
 
 # -----------------------------
@@ -419,13 +444,12 @@ def load_drafts_leagues(raw_dir: str, season: int) -> Tuple[pd.DataFrame, pd.Dat
     if not os.path.exists(drafts_path):
         raise FileNotFoundError(f"Missing RAW drafts parquet:\n{drafts_path}")
 
-    # Read only columns we need for filtering/date bounds
     drafts_cols = [
         "draft_id", "league_id", "season", "draft_status", "type",
         "md_scoring_type", "st_teams", "st_rounds",
         "start_time", "created",
     ]
-    # metadata pass
+
     meta_all = pd.read_parquet(drafts_path, engine="pyarrow", columns=None).columns
     drafts_cols = [c for c in drafts_cols if c in meta_all]
 
@@ -438,7 +462,6 @@ def load_drafts_leagues(raw_dir: str, season: int) -> Tuple[pd.DataFrame, pd.Dat
 
     leagues = pd.DataFrame()
     if os.path.exists(leagues_path):
-        # Only need league_id + bonus_rec_te for te-prem filter
         leagues = pd.read_parquet(leagues_path, engine="pyarrow")
         if "league_id" in leagues.columns:
             leagues["league_id"] = leagues["league_id"].astype(str)
@@ -446,11 +469,6 @@ def load_drafts_leagues(raw_dir: str, season: int) -> Tuple[pd.DataFrame, pd.Dat
     return drafts, leagues
 
 def load_picks_for_draft_ids(raw_dir: str, season: int, draft_ids: List[str]) -> pd.DataFrame:
-    """
-    IMPORTANT: This is the key crash fix.
-    We load ONLY needed columns from picks parquet, then filter to matching draft_ids.
-    We do NOT cache this to avoid ballooning memory across reruns.
-    """
     _drafts_path, picks_path, _leagues_path = season_raw_paths(raw_dir, season)
     if not os.path.exists(picks_path):
         raise FileNotFoundError(f"Missing RAW picks parquet:\n{picks_path}")
@@ -468,7 +486,6 @@ def load_picks_for_draft_ids(raw_dir: str, season: int, draft_ids: List[str]) ->
         raise RuntimeError(f"picks parquet missing required columns. Found columns: {list(meta_cols)[:50]} ...")
 
     picks = pd.read_parquet(picks_path, engine="pyarrow", columns=cols)
-
     picks["draft_id"] = picks["draft_id"].astype(str)
     picks["player_id"] = picks["player_id"].astype(str)
 
@@ -560,7 +577,6 @@ def load_ppg(season: int) -> pd.DataFrame:
     merged = players_df.merge(stats_df, on="player_id", how="left")
     merged["fantasy_pts"] = calc_fantasy_points(merged, SCORING)
 
-    gp = None
     if "gp" in merged.columns:
         gp = pd.to_numeric(merged["gp"], errors="coerce")
     elif "g" in merged.columns:
@@ -651,37 +667,38 @@ def filter_drafts(
 
 
 # ============================================================
-# Rookie logic (FIXED)
+# Rookie logic (season-correct across all years)
 # ============================================================
-def is_rookie_for_season_row(row: pd.Series, season: int) -> bool:
-    """
-    More robust 'rookie-eligible' logic:
-    - If rookie_year exists: treat rookie_year == season OR rookie_year == season-1 as eligible
-      (helps in offseason / data-lag situations).
-    - If rookie_year missing: use years_exp <= 1.
-    """
-    ry = row.get("rookie_year", np.nan)
-    ye = row.get("years_exp", np.nan)
+def _estimate_rookie_year_from_years_exp(years_exp: Any, current_season_year: int) -> Optional[int]:
+    try:
+        if years_exp is None or (isinstance(years_exp, float) and np.isnan(years_exp)):
+            return None
+        ye = int(years_exp)
+        if ye < 0 or ye > 25:
+            return None
+        return int(current_season_year) - ye
+    except Exception:
+        return None
 
+def is_rookie_for_season_row(row: pd.Series, season: int, current_season_year: int) -> bool:
+    ry = row.get("rookie_year", np.nan)
     if pd.notna(ry):
         try:
-            ry_i = int(ry)
-            return ry_i in {int(season), int(season) - 1}
+            return int(ry) == int(season)
         except Exception:
             pass
 
-    if pd.notna(ye):
-        try:
-            return int(ye) <= 1
-        except Exception:
-            pass
+    ye = row.get("years_exp", np.nan)
+    est = _estimate_rookie_year_from_years_exp(ye, current_season_year)
+    if est is not None:
+        return int(est) == int(season)
 
     return False
 
-def filter_rookies_by_season(df: pd.DataFrame, season: int, keep_rookies: bool) -> pd.DataFrame:
+def filter_rookies_by_season(df: pd.DataFrame, season: int, keep_rookies: bool, current_season_year: int) -> pd.DataFrame:
     if df.empty:
         return df
-    mask = df.apply(lambda r: is_rookie_for_season_row(r, season), axis=1)
+    mask = df.apply(lambda r: is_rookie_for_season_row(r, season, current_season_year), axis=1)
     return df[mask].copy() if keep_rookies else df[~mask].copy()
 
 
@@ -986,6 +1003,7 @@ def show_player_dialog(
     sel_row: pd.Series,
     ppg_season: int,
     picks_subset: pd.DataFrame,
+    draft_month_meta: pd.DataFrame,
 ) -> None:
     try:
         sel_name = safe_str(sel_row.get("full_name", "Unknown"))
@@ -994,6 +1012,9 @@ def show_player_dialog(
         sel_pid = safe_str(sel_row.get("player_id", ""))
 
         sel_is_rp = bool(sel_row.get("is_rookie_pick", False)) or sel_pos == "RDP" or sel_pid.startswith("ROOKIE_PICK_")
+
+        st.markdown(f"### {sel_name}")
+        st.caption(f"{sel_team} • {POSITION_TEXT.get(sel_pos, sel_pos)}")
 
         top = st.columns([1.15, 2.85], gap="large")
         with top[0]:
@@ -1004,9 +1025,6 @@ def show_player_dialog(
                 st.caption("Rookie pick placeholder")
 
         with top[1]:
-            st.markdown(f"### {sel_name}")
-            st.caption(f"{sel_team} • {POSITION_TEXT.get(sel_pos, sel_pos)}")
-
             pos_rank_val = sel_row.get("pos_rank", np.nan)
             drafts_val = sel_row.get("drafts", np.nan)
             ppg_val = sel_row.get("ppg", np.nan)
@@ -1016,22 +1034,17 @@ def show_player_dialog(
                 med_price = sel_row.get("med_price", np.nan)
                 min_price = sel_row.get("min_price", np.nan)
                 max_price = sel_row.get("max_price", np.nan)
-                sales = sel_row.get("sales", np.nan)
 
                 r1 = st.columns(4)
                 r1[0].metric("Avg $", f"{float(avg_price):.2f}" if pd.notna(avg_price) else "—")
                 r1[1].metric("Median $", f"{float(med_price):.2f}" if pd.notna(med_price) else "—")
-                r1[2].metric("Sales", f"{int(sales):,}" if pd.notna(sales) else "—")
-                r1[3].metric("Pos Rank", f"{int(pos_rank_val):,}" if pd.notna(pos_rank_val) else "—")
+                r1[2].metric("Pos Rank", f"{int(pos_rank_val):,}" if pd.notna(pos_rank_val) else "—")
+                r1[3].metric("Drafts", f"{int(drafts_val):,}" if pd.notna(drafts_val) else "—")
 
                 r2 = st.columns(3)
                 r2[0].metric("Min $", f"{float(min_price):.0f}" if pd.notna(min_price) else "—")
                 r2[1].metric("Max $", f"{float(max_price):.0f}" if pd.notna(max_price) else "—")
                 r2[2].metric(f"PPG ({ppg_season})", f"{float(ppg_val):.2f}" if pd.notna(ppg_val) else "—")
-
-                r3 = st.columns(2)
-                r3[0].metric("Drafts", f"{int(drafts_val):,}" if pd.notna(drafts_val) else "—")
-                r3[1].metric("Team", sel_team if sel_team else "—")
 
             else:
                 adp_val = sel_row.get("adp", np.nan)
@@ -1040,9 +1053,9 @@ def show_player_dialog(
 
                 r1 = st.columns(4)
                 r1[0].metric("ADP", f"{float(adp_val):.2f}" if pd.notna(adp_val) else "—")
-                r1[1].metric(f"PPG ({ppg_season})", f"{float(ppg_val):.2f}" if pd.notna(ppg_val) else "—")
+                r1[1].metric("Pos Rank", f"{int(pos_rank_val):,}" if pd.notna(pos_rank_val) else "—")
                 r1[2].metric("Drafts", f"{int(drafts_val):,}" if pd.notna(drafts_val) else "—")
-                r1[3].metric("Pos Rank", f"{int(pos_rank_val):,}" if pd.notna(pos_rank_val) else "—")
+                r1[3].metric(f"PPG ({ppg_season})", f"{float(ppg_val):.2f}" if pd.notna(ppg_val) else "—")
 
                 r2 = st.columns(2)
                 r2[0].metric("Min Pick", f"{float(min_pick_val):.0f}" if pd.notna(min_pick_val) else "—")
@@ -1050,6 +1063,67 @@ def show_player_dialog(
 
         st.divider()
 
+        # -----------------------------
+        # Month-to-month trend (ADP / Avg $)
+        # -----------------------------
+        st.markdown("#### Month-to-month trend")
+        trend_df = pd.DataFrame()
+
+        if picks_subset is not None and len(picks_subset) > 0 and not draft_month_meta.empty:
+            dm = draft_month_meta.copy()
+            dm["draft_id"] = dm["draft_id"].astype(str)
+            ps = picks_subset.copy()
+            ps["draft_id"] = ps["draft_id"].astype(str)
+
+            trend_df = ps.merge(dm, on="draft_id", how="left")
+            trend_df = trend_df[trend_df["start_month"].notna()].copy()
+
+            if mode == "auction":
+                if "amount" in trend_df.columns:
+                    trend_df["amount"] = pd.to_numeric(trend_df["amount"], errors="coerce")
+                    trend = (
+                        trend_df.groupby("start_month", as_index=False)
+                        .agg(avg_amount=("amount", "mean"), n=("amount", "size"))
+                        .sort_values("start_month")
+                    )
+                    if len(trend) >= 2:
+                        fig = plt.figure()
+                        plt.plot(trend["start_month"], trend["avg_amount"])
+                        plt.xticks(rotation=45, ha="right")
+                        plt.xlabel("Month")
+                        plt.ylabel("Avg auction $")
+                        st.pyplot(fig, clear_figure=True)
+                    else:
+                        st.info("Not enough monthly auction data points to plot a trend for this player.")
+                else:
+                    st.info("No auction amount data available for this player.")
+            else:
+                if "pick_no_calc" in trend_df.columns:
+                    trend_df["pick_no_calc"] = pd.to_numeric(trend_df["pick_no_calc"], errors="coerce")
+                    trend = (
+                        trend_df.groupby("start_month", as_index=False)
+                        .agg(avg_pick=("pick_no_calc", "mean"), n=("pick_no_calc", "size"))
+                        .sort_values("start_month")
+                    )
+                    if len(trend) >= 2:
+                        fig = plt.figure()
+                        plt.plot(trend["start_month"], trend["avg_pick"])
+                        plt.xticks(rotation=45, ha="right")
+                        plt.xlabel("Month")
+                        plt.ylabel("Avg overall pick (ADP)")
+                        st.pyplot(fig, clear_figure=True)
+                    else:
+                        st.info("Not enough monthly ADP data points to plot a trend for this player.")
+                else:
+                    st.info("No pick data available for this player.")
+        else:
+            st.info("No monthly data found for this player in the filtered draft set.")
+
+        st.divider()
+
+        # -----------------------------
+        # Distribution
+        # -----------------------------
         if mode == "auction":
             st.markdown("#### Auction price distribution")
             if picks_subset is None or len(picks_subset) == 0:
@@ -1084,7 +1158,7 @@ def show_player_dialog(
 
 
 # ============================================================
-# Board renderer (FIXED card meta)
+# Board renderer (slot label restored + name overlay)
 # ============================================================
 def render_board_clickable_tiles(
     mapping: Dict[Tuple[int, int], Dict[str, Any]],
@@ -1124,7 +1198,6 @@ def render_board_clickable_tiles(
                 pid = safe_str(cell.get("player_id", ""))
                 name = safe_str(cell.get("full_name", ""))
                 pos = normalize_pos(cell.get("position", "UNK"))
-                team = safe_str(cell.get("team", ""))
                 bg = POSITION_COLORS.get(pos, POSITION_COLORS["UNK"])
 
                 pos_rank = cell.get("pos_rank", None)
@@ -1133,42 +1206,35 @@ def render_board_clickable_tiles(
                 else:
                     rank_label = POSITION_TEXT.get(pos, pos)
 
-                # keep pick label pill for context
-                if is_snake_board:
-                    pick_label = format_pick_label_snake(r, t, int(num_teams))
-                else:
-                    pick_label = format_pick_label_linear(r, t)
-
-                # Primary value pill + drafts pill
+                # Slot label pill (this is what you wanted back)
                 if mode == "auction":
                     val = cell.get("avg_price", np.nan)
-                    value_pill = f"Avg ${float(val):.0f}" if pd.notna(val) else "Avg $ —"
+                    right_pill = f"${float(val):.0f}" if pd.notna(val) else "—"
                 else:
-                    adp_val = cell.get("adp", np.nan)
-                    value_pill = f"ADP {float(adp_val):.1f}" if pd.notna(adp_val) else "ADP —"
-
-                drafts_val = cell.get("drafts", np.nan)
-                drafts_pill = f"{int(drafts_val)} drafts" if pd.notna(drafts_val) else "drafts —"
-                team_pill = team if team else "—"
+                    if is_snake_board:
+                        right_pill = format_pick_label_snake(r, t, int(num_teams))
+                    else:
+                        right_pill = format_pick_label_linear(r, t)
 
                 is_rp = bool(cell.get("is_rookie_pick", False)) or (pos == "RDP") or pid.startswith("ROOKIE_PICK_")
 
                 if is_rp:
-                    top_html = "<div class='rp-top'>🔴</div>"
+                    top_html = f"<div class='rp-top'><div class='card-name-top'>{name}</div>🔴</div>"
                 else:
                     img = sleeper_headshot_url(pid)
-                    top_html = f"<div class='card-top'><img src='{img}' loading='lazy' /></div>"
+                    top_html = (
+                        f"<div class='card-top'>"
+                        f"  <div class='card-name-top'>{name}</div>"
+                        f"  <img src='{img}' loading='lazy' />"
+                        f"</div>"
+                    )
 
                 bottom_html = (
                     f"<div class='card-bottom' style='background:{bg};'>"
                     f"  <div class='name'>{name}</div>"
                     f"  <div class='meta'>"
                     f"    <span class='pill'>{rank_label}</span>"
-                    f"    <span class='pill'>{team_pill}</span>"
-                    f"  </div>"
-                    f"  <div class='meta2'>"
-                    f"    <span class='pill'>{value_pill}</span>"
-                    f"    <span class='pill'>{drafts_pill}</span>"
+                    f"    <span class='pill'>{right_pill}</span>"
                     f"  </div>"
                     f"</div>"
                 )
@@ -1382,7 +1448,7 @@ required_player_drafts = int(min_drafts_per_month) * max(len(months_in_scope), 1
 
 draft_ids = drafts_f["draft_id"].astype(str).unique().tolist()
 
-# THIS is the crash fix: load only picks for those draft_ids
+# crash fix: load only picks for those draft_ids
 try:
     picks_f = load_picks_for_draft_ids(raw_dir, int(season), draft_ids)
 except Exception as e:
@@ -1454,21 +1520,53 @@ pool_for_board = pool.copy()
 
 # Rookie filtering
 if mode == "adp" and board_kind.startswith("Rookie"):
-    pool_for_board = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=True)
+    pool_for_board = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=True, current_season_year=CURRENT_SEASON_YEAR)
     if pool_for_board.empty:
         st.warning("No rookie-eligible players.")
         st.stop()
 
 if mode == "adp" and board_kind.startswith("Startup"):
     if startup_inclusion_mode == "Exclude rookies and rookie picks":
-        pool_for_board = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=False)
+        pool_for_board = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=False, current_season_year=CURRENT_SEASON_YEAR)
         if "is_rookie_pick" in pool_for_board.columns:
             pool_for_board = pool_for_board[~pool_for_board["is_rookie_pick"].astype(bool)].copy()
 
+    elif startup_inclusion_mode == "Include rookie picks (K placeholders)":
+        # ✅ Keep rookie pick placeholders, but remove rookie *players*
+        rook_mask = pool_for_board.apply(
+            lambda r: is_rookie_for_season_row(r, int(season), CURRENT_SEASON_YEAR),
+            axis=1
+        )
+        is_rp = pool_for_board.get("is_rookie_pick", pd.Series(False, index=pool_for_board.index)).astype(bool)
+        pool_for_board = pool_for_board[(~rook_mask) | (is_rp)].copy()
+
 pool_for_board["position"] = pool_for_board["position"].map(normalize_pos)
 
+# Pos ranks + mapping
+if mode == "auction":
+    pool_for_board["avg_price"] = pd.to_numeric(pool_for_board["avg_price"], errors="coerce")
+    pool_for_board = pool_for_board.sort_values(["position", "avg_price"], ascending=[True, False]).reset_index(drop=True)
+    pool_for_board["pos_rank"] = pool_for_board.groupby("position").cumcount() + 1
+    mapping = build_board_map_snake_by_col(pool_for_board, int(num_teams), int(num_rounds), sort_col="avg_price", asc=False)
+else:
+    pool_for_board["adp"] = pd.to_numeric(pool_for_board["adp"], errors="coerce")
+    pool_for_board = pool_for_board.sort_values(["position", "adp"], ascending=[True, True]).reset_index(drop=True)
+    pool_for_board["pos_rank"] = pool_for_board.groupby("position").cumcount() + 1
+    if board_kind.startswith("Startup"):
+        mapping = build_board_map_snake_by_col(pool_for_board, int(num_teams), int(num_rounds), sort_col="adp", asc=True)
+    else:
+        mapping = build_board_map_linear_by_col(pool_for_board, int(num_teams), int(num_rounds), sort_col="adp", asc=True)
+
+build_t1 = _now()
+
+# Summary metrics
+m1, m2, m3 = st.columns(3)
+m1.metric("Drafts", f"{len(draft_ids):,}")
+m2.metric("Months in date range", f"{len(months_in_scope):,}")
+m3.metric("Min drafts per entity", f"{required_player_drafts:,}")
+
 # ============================================================
-# Export current board (long-form list)  ✅ FIX #3
+# Export current board (long-form list)
 # ============================================================
 st.divider()
 with st.expander("📤 Export current board (long-form list)", expanded=False):
@@ -1526,29 +1624,6 @@ with st.expander("📤 Export current board (long-form list)", expanded=False):
     )
     st.caption("This export reflects all current filters and the selected board type.")
 
-# Pos ranks + mapping
-if mode == "auction":
-    pool_for_board["avg_price"] = pd.to_numeric(pool_for_board["avg_price"], errors="coerce")
-    pool_for_board = pool_for_board.sort_values(["position", "avg_price"], ascending=[True, False]).reset_index(drop=True)
-    pool_for_board["pos_rank"] = pool_for_board.groupby("position").cumcount() + 1
-    mapping = build_board_map_snake_by_col(pool_for_board, int(num_teams), int(num_rounds), sort_col="avg_price", asc=False)
-else:
-    pool_for_board["adp"] = pd.to_numeric(pool_for_board["adp"], errors="coerce")
-    pool_for_board = pool_for_board.sort_values(["position", "adp"], ascending=[True, True]).reset_index(drop=True)
-    pool_for_board["pos_rank"] = pool_for_board.groupby("position").cumcount() + 1
-    if board_kind.startswith("Startup"):
-        mapping = build_board_map_snake_by_col(pool_for_board, int(num_teams), int(num_rounds), sort_col="adp", asc=True)
-    else:
-        mapping = build_board_map_linear_by_col(pool_for_board, int(num_teams), int(num_rounds), sort_col="adp", asc=True)
-
-build_t1 = _now()
-
-# Summary metrics
-m1, m2, m3 = st.columns(3)
-m1.metric("Drafts", f"{len(draft_ids):,}")
-m2.metric("Months in date range", f"{len(months_in_scope):,}")
-m3.metric("Min drafts per entity", f"{required_player_drafts:,}")
-
 # Render board
 if mode == "auction":
     st.subheader("Auction Price Board")
@@ -1599,6 +1674,10 @@ if pid and st.session_state.get("dialog_open", False):
         else:
             sel_row = sel.iloc[0]
 
+            # draft->month meta for month-to-month trend
+            draft_month_meta = drafts_f[["draft_id", "start_month"]].copy()
+            draft_month_meta["draft_id"] = draft_month_meta["draft_id"].astype(str)
+
             p_sub = picks_f[picks_f["player_id"].astype(str) == str(pid)].copy()
             if mode == "auction":
                 if "md_amount" in p_sub.columns:
@@ -1611,7 +1690,13 @@ if pid and st.session_state.get("dialog_open", False):
                 p_sub["pick_no_calc"] = pd.to_numeric(p_sub["pick_no_calc"], errors="coerce")
                 p_sub = p_sub[p_sub["pick_no_calc"].notna()].copy()
 
-            show_player_dialog(mode, sel_row, int(ppg_season) if LOAD_PPG else int(season), p_sub)
+            show_player_dialog(
+                mode=mode,
+                sel_row=sel_row,
+                ppg_season=int(ppg_season) if LOAD_PPG else int(season),
+                picks_subset=p_sub,
+                draft_month_meta=draft_month_meta,
+            )
 
     except Exception as e:
         _dbg_exception("dialog selection flow", e)
