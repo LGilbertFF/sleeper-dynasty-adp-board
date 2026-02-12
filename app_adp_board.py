@@ -9,8 +9,9 @@
 # - Make PPG optional (OFF by default) to avoid large API payloads.
 #
 # FIXES (2026-02-09 / 2026-02-10 / 2026-02-11 / 2026-02-09b):
-# ✅ Rookie boards wrong (older seasons / rookies missing) -> STRICT rookie eligibility:
-#    rookie_year == season OR (rookie_year missing AND years_exp in {0,1})
+# ✅ Rookie boards wrong (older seasons / rookies missing) -> season-correct inferred rookie_year:
+#    rookie_year == season OR (rookie_year missing AND inferred_rookie_year == season),
+#    where inferred_rookie_year = (anchor_year) - years_exp.
 # ✅ Rookie board MUST show rookie PLAYERS only (never rookie-pick placeholders)
 # ✅ Startup inclusion "Include rookie picks (K placeholders)" should NOT include rookie players
 #    -> exclude rookies (players) but keep RDP placeholders
@@ -20,6 +21,7 @@
 # ✅ Dialog: ADP/PPG/Pos Rank not cut off -> widen dialog + allow metric value wrap + reduce metrics per row
 # ✅ Add back month-to-month trend graph (ADP or Avg$) for selected player
 # ✅ Export: download CSV (long-form list) for current selected board (all filters)
+# ✅ NEW: Rookie audit CSV export (explicit/inferred/final rookie year + eligibility)
 #
 # MEMORY REDUCTION (2026-02-09):
 # ✅ Use pyarrow.dataset filter pushdown to load ONLY picks for filtered draft_ids
@@ -365,6 +367,23 @@ def snake_picks(num_teams: int, num_rounds: int) -> List[Dict[str, int]]:
     return out
 
 # ============================================================
+# Rookie-year anchor + inference
+# ============================================================
+def rookie_anchor_year() -> int:
+    """
+    You explicitly want:
+      2025 rookies have years_exp=1 in 2026,
+      2024 rookies have years_exp=2 in 2026, etc.
+    That implies: inferred_rookie_year = (anchor_year) - years_exp
+    We set anchor_year = current UTC calendar year.
+    """
+    return int(datetime.utcnow().year)
+
+def infer_rookie_year_from_years_exp(years_exp: pd.Series, anchor_year: int) -> pd.Series:
+    ye = pd.to_numeric(years_exp, errors="coerce")
+    return (anchor_year - ye).where(ye.notna(), np.nan)
+
+# ============================================================
 # Robust timestamp handling (seconds vs ms)
 # ============================================================
 def add_time_columns(drafts: pd.DataFrame) -> pd.DataFrame:
@@ -634,10 +653,10 @@ def infer_pick_no(picks: pd.DataFrame) -> pd.Series:
                 return s
     if "round" in picks.columns and "draft_slot" in picks.columns:
         r = pd.to_numeric(picks["round"], errors="coerce").astype("float64")
-        ds = pd.to_numeric(picks["draft_slot"], errors="coerce").astype("float64")
+        ds_ = pd.to_numeric(picks["draft_slot"], errors="coerce").astype("float64")
         r = r.replace([np.inf, -np.inf], np.nan).where((r >= 1) & (r <= 80))
-        ds = ds.replace([np.inf, -np.inf], np.nan).where((ds >= 1) & (ds <= 32))
-        return (r - 1.0) * 12.0 + ds
+        ds_ = ds_.replace([np.inf, -np.inf], np.nan).where((ds_ >= 1) & (ds_ <= 32))
+        return (r - 1.0) * 12.0 + ds_
     return pd.Series(np.nan, index=picks.index)
 
 def filter_drafts(
@@ -696,28 +715,29 @@ def filter_drafts(
     return df.copy()
 
 # ============================================================
-# Rookie logic (STRICT / season-correct) - vectorized
-# KEY FIX: allow years_exp in {0,1} when rookie_year is missing.
+# Rookie logic (SEASON-CORRECT) - vectorized
+# - If rookie_year present: use it
+# - Else infer rookie_year = (anchor_year) - years_exp
+# - Rookie eligible for season S iff rookie_year_final == S
 # ============================================================
 def _rookie_player_mask(df: pd.DataFrame, season: int) -> pd.Series:
     if df.empty:
         return pd.Series([], dtype=bool)
 
+    season = int(season)
+
     ry = pd.to_numeric(df.get("rookie_year", np.nan), errors="coerce")
     ye = pd.to_numeric(df.get("years_exp", np.nan), errors="coerce")
 
-    # STRICT:
-    # 1) If rookie_year present -> rookie_year == season
-    # 2) If rookie_year missing -> years_exp in {0,1}
-    ry_ok = (ry.notna() & (ry.astype("Int64") == int(season)))
-    ye_ok = (ry.isna() & (ye.fillna(-999).astype("Int64").isin([0, 1])))
+    anchor = rookie_anchor_year()
+    inferred_ry = infer_rookie_year_from_years_exp(ye, anchor)
 
-    return (ry_ok | ye_ok).fillna(False)
+    ry_final = ry.where(ry.notna(), inferred_ry)
+    return (pd.to_numeric(ry_final, errors="coerce").round().astype("Int64") == season).fillna(False)
 
 def filter_rookies_by_season(df: pd.DataFrame, season: int, keep_rookies: bool) -> pd.DataFrame:
     if df.empty:
         return df
-
     mask = _rookie_player_mask(df, season)
     return df[mask].copy() if keep_rookies else df[~mask].copy()
 
@@ -1558,7 +1578,7 @@ if pool.empty:
 pool_for_board = pool.copy()
 
 # ============================================================
-# Rookie filtering (FIXED)
+# Rookie filtering (SEASON-CORRECT)
 # - Rookie board: rookies (players) ONLY, NEVER placeholders
 # - Startup: options behave as described
 # ============================================================
@@ -1576,7 +1596,10 @@ if mode == "adp" and board_kind.startswith("Rookie"):
     pool_for_board = pool_for_board[~is_rdp_placeholder].copy()
     pool_for_board = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=True)
     if pool_for_board.empty:
-        st.warning("No rookie-eligible players after filtering (rookie_year==season OR years_exp in {0,1} when rookie_year missing).")
+        st.warning(
+            "No rookie-eligible players after filtering "
+            "(rookie_year==season OR inferred_rookie_year==season when rookie_year missing)."
+        )
         st.stop()
 
 if mode == "adp" and board_kind.startswith("Startup"):
@@ -1700,9 +1723,11 @@ if DEBUG:
     st.divider()
     st.markdown("### 🧪 DEBUG: Memory + timings")
 
-    # helpful rookie sanity counts
-    rookie_mask_all = _rookie_player_mask(pool_for_board, int(season)) if (mode == "adp" and ("rookie_year" in pool_for_board.columns or "years_exp" in pool_for_board.columns)) else None
-    rookie_count_all = int(rookie_mask_all.sum()) if rookie_mask_all is not None and len(rookie_mask_all) else None
+    rookie_mask_all = None
+    rookie_count_all = None
+    if (mode == "adp") and (("rookie_year" in pool_for_board.columns) or ("years_exp" in pool_for_board.columns)):
+        rookie_mask_all = _rookie_player_mask(pool_for_board, int(season))
+        rookie_count_all = int(rookie_mask_all.sum()) if len(rookie_mask_all) else None
 
     st.write(
         {
@@ -1721,11 +1746,56 @@ if DEBUG:
             "pool_rows": int(len(pool_for_board)),
             "pool_mem_mb": round(_df_mem_mb(pool_for_board), 2),
             "rookie_count_in_pool_for_board": rookie_count_all,
+            "rookie_anchor_year": rookie_anchor_year(),
             "build_time": _fmt_secs(build_t1 - build_t0),
             "LOAD_PPG": LOAD_PPG,
         }
     )
     st.caption("If rss_mb is still huge, reduce date range and/or Min drafts per month.")
+
+    # ============================================================
+    # Rookie audit export (CSV)
+    # ============================================================
+    with st.expander("🧾 Rookie audit export (debug)", expanded=False):
+        if mode != "adp":
+            st.info("Rookie audit is only relevant for ADP mode.")
+        elif pool_for_board.empty:
+            st.info("No pool available.")
+        else:
+            anchor = rookie_anchor_year()
+            ye = pd.to_numeric(pool_for_board.get("years_exp", np.nan), errors="coerce")
+            ry = pd.to_numeric(pool_for_board.get("rookie_year", np.nan), errors="coerce")
+            inferred_ry = infer_rookie_year_from_years_exp(ye, anchor)
+            final_ry = ry.where(ry.notna(), inferred_ry)
+
+            eligible = (pd.to_numeric(final_ry, errors="coerce").round().astype("Int64") == int(season)).fillna(False)
+
+            audit = pd.DataFrame(
+                {
+                    "player_id": pool_for_board.get("player_id", pd.Series([], dtype="string")).astype("string"),
+                    "full_name": pool_for_board.get("full_name", ""),
+                    "position": pool_for_board.get("position", ""),
+                    "team": pool_for_board.get("team", ""),
+                    "years_exp": ye,
+                    "rookie_year_explicit": ry,
+                    "rookie_year_inferred": inferred_ry,
+                    "rookie_year_final": final_ry,
+                    "eligible_for_selected_season": eligible.astype(bool),
+                    "selected_season": int(season),
+                    "anchor_year": int(anchor),
+                }
+            )
+
+            st.caption("Tip: sort by rookie_year_final then years_exp to sanity check older seasons.")
+            st.dataframe(audit.head(50), use_container_width=True)
+
+            audit_csv = audit.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download rookie audit CSV",
+                data=audit_csv,
+                file_name=f"rookie_audit_season_{int(season)}_anchor_{int(anchor)}.csv",
+                mime="text/csv",
+            )
 
 # -----------------------------
 # Dialog
