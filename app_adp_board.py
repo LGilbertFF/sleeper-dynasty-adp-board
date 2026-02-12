@@ -8,10 +8,9 @@
 # - Do NOT cache big picks DataFrames in st.cache_data or st.session_state.
 # - Make PPG optional (OFF by default) to avoid large API payloads.
 #
-# FIXES (2026-02-09 / 2026-02-10 / 2026-02-11 / 2026-02-11b):
-# ✅ Rookie boards wrong (older seasons / rookies missing) -> SEASON-CORRECT rookie eligibility:
-#    rookie_year == season OR (rookie_year missing AND inferred_rookie_year == season)
-#    inferred_rookie_year = current_nfl_season - years_exp
+# FIXES (2026-02-09 / 2026-02-10 / 2026-02-11 / 2026-02-09b):
+# ✅ Rookie boards wrong (older seasons / rookies missing) -> STRICT rookie eligibility:
+#    rookie_year == season OR (rookie_year missing AND years_exp in {0,1})
 # ✅ Rookie board MUST show rookie PLAYERS only (never rookie-pick placeholders)
 # ✅ Startup inclusion "Include rookie picks (K placeholders)" should NOT include rookie players
 #    -> exclude rookies (players) but keep RDP placeholders
@@ -20,7 +19,7 @@
 # ✅ Dialog: positional rank format "RB16", "WR2", etc.
 # ✅ Dialog: ADP/PPG/Pos Rank not cut off -> widen dialog + allow metric value wrap + reduce metrics per row
 # ✅ Add back month-to-month trend graph (ADP or Avg$) for selected player
-# ✅ Export: download CSV (long-form list) for current selected board (all filters) as a BUTTON (no dropdown)
+# ✅ Export: download CSV (long-form list) for current selected board (all filters)
 #
 # MEMORY REDUCTION (2026-02-09):
 # ✅ Use pyarrow.dataset filter pushdown to load ONLY picks for filtered draft_ids
@@ -144,7 +143,7 @@ APP_CSS = """
   div[data-testid="stMetricValue"] {
     overflow: visible !important;
     text-overflow: clip !important;
-    white-space: normal !important;   /* wrap */
+    white-space: normal !important;   /* key change (wrap) */
     line-height: 1.05 !important;
     max-width: 100% !important;
   }
@@ -364,17 +363,6 @@ def snake_picks(num_teams: int, num_rounds: int) -> List[Dict[str, int]]:
             team = pick_in_round if (r % 2 == 1) else (num_teams - pick_in_round + 1)
             out.append({"round": r, "pick_in_round": pick_in_round, "team": team})
     return out
-
-def current_nfl_season_year() -> int:
-    """
-    Best-effort anchor for Sleeper's years_exp:
-    years_exp is relative to the CURRENT NFL season.
-      - Feb–Jul: treat as prior season year
-      - Aug–Jan: treat as current season year
-    """
-    now = datetime.utcnow()
-    y = now.year
-    return y if now.month >= 8 else (y - 1)
 
 # ============================================================
 # Robust timestamp handling (seconds vs ms)
@@ -646,10 +634,10 @@ def infer_pick_no(picks: pd.DataFrame) -> pd.Series:
                 return s
     if "round" in picks.columns and "draft_slot" in picks.columns:
         r = pd.to_numeric(picks["round"], errors="coerce").astype("float64")
-        ds_ = pd.to_numeric(picks["draft_slot"], errors="coerce").astype("float64")
+        ds = pd.to_numeric(picks["draft_slot"], errors="coerce").astype("float64")
         r = r.replace([np.inf, -np.inf], np.nan).where((r >= 1) & (r <= 80))
-        ds_ = ds_.replace([np.inf, -np.inf], np.nan).where((ds_ >= 1) & (ds_ <= 32))
-        return (r - 1.0) * 12.0 + ds_
+        ds = ds.replace([np.inf, -np.inf], np.nan).where((ds >= 1) & (ds <= 32))
+        return (r - 1.0) * 12.0 + ds
     return pd.Series(np.nan, index=picks.index)
 
 def filter_drafts(
@@ -708,31 +696,28 @@ def filter_drafts(
     return df.copy()
 
 # ============================================================
-# Rookie logic (season-correct) - vectorized
-# FIX: older seasons broke because years_exp grows over time.
-# We infer rookie_year when missing:
-#   rookie_year_inferred = current_nfl_season - years_exp
-# Then rookie-eligible for season S if rookie_year_final == S
+# Rookie logic (STRICT / season-correct) - vectorized
+# KEY FIX: allow years_exp in {0,1} when rookie_year is missing.
 # ============================================================
 def _rookie_player_mask(df: pd.DataFrame, season: int) -> pd.Series:
     if df.empty:
         return pd.Series([], dtype=bool)
 
-    season = int(season)
-
     ry = pd.to_numeric(df.get("rookie_year", np.nan), errors="coerce")
     ye = pd.to_numeric(df.get("years_exp", np.nan), errors="coerce")
 
-    cur = int(current_nfl_season_year())
-    inferred_ry = (cur - ye).where(ye.notna(), np.nan)
+    # STRICT:
+    # 1) If rookie_year present -> rookie_year == season
+    # 2) If rookie_year missing -> years_exp in {0,1}
+    ry_ok = (ry.notna() & (ry.astype("Int64") == int(season)))
+    ye_ok = (ry.isna() & (ye.fillna(-999).astype("Int64").isin([0, 1])))
 
-    ry_final = ry.where(ry.notna(), inferred_ry)
-
-    return (pd.to_numeric(ry_final, errors="coerce").round().astype("Int64") == season).fillna(False)
+    return (ry_ok | ye_ok).fillna(False)
 
 def filter_rookies_by_season(df: pd.DataFrame, season: int, keep_rookies: bool) -> pd.DataFrame:
     if df.empty:
         return df
+
     mask = _rookie_player_mask(df, season)
     return df[mask].copy() if keep_rookies else df[~mask].copy()
 
@@ -1573,7 +1558,7 @@ if pool.empty:
 pool_for_board = pool.copy()
 
 # ============================================================
-# Rookie filtering
+# Rookie filtering (FIXED)
 # - Rookie board: rookies (players) ONLY, NEVER placeholders
 # - Startup: options behave as described
 # ============================================================
@@ -1591,10 +1576,7 @@ if mode == "adp" and board_kind.startswith("Rookie"):
     pool_for_board = pool_for_board[~is_rdp_placeholder].copy()
     pool_for_board = filter_rookies_by_season(pool_for_board, int(season), keep_rookies=True)
     if pool_for_board.empty:
-        st.warning(
-            "No rookie-eligible players after filtering "
-            "(rookie_year==season OR inferred rookie_year==season when rookie_year missing)."
-        )
+        st.warning("No rookie-eligible players after filtering (rookie_year==season OR years_exp in {0,1} when rookie_year missing).")
         st.stop()
 
 if mode == "adp" and board_kind.startswith("Startup"):
@@ -1634,74 +1616,73 @@ except Exception:
     pass
 gc.collect()
 
-m1, m2, m3, m4 = st.columns([1, 1, 1, 2])
+m1, m2, m3 = st.columns(3)
 m1.metric("Drafts", f"{len(draft_ids):,}")
 m2.metric("Months", f"{len(months_in_scope):,}")
 m3.metric("Min drafts/entity", f"{required_player_drafts:,}")
 
 # ============================================================
-# Export current board (long-form list) — BUTTON (no dropdown)
+# Export current board (long-form list)
 # ============================================================
-export_df = pool_for_board.copy()
+st.divider()
+with st.expander("📤 Export current board (long-form list)", expanded=False):
+    export_df = pool_for_board.copy()
 
-if mode == "auction":
-    export_df["avg_price"] = pd.to_numeric(export_df.get("avg_price", np.nan), errors="coerce")
-    export_df = export_df.sort_values(["avg_price", "drafts"], ascending=[False, False]).reset_index(drop=True)
-else:
-    export_df["adp"] = pd.to_numeric(export_df.get("adp", np.nan), errors="coerce")
-    export_df = export_df.sort_values(["adp", "drafts"], ascending=[True, False]).reset_index(drop=True)
+    if mode == "auction":
+        export_df["avg_price"] = pd.to_numeric(export_df.get("avg_price", np.nan), errors="coerce")
+        export_df = export_df.sort_values(["avg_price", "drafts"], ascending=[False, False]).reset_index(drop=True)
+    else:
+        export_df["adp"] = pd.to_numeric(export_df.get("adp", np.nan), errors="coerce")
+        export_df = export_df.sort_values(["adp", "drafts"], ascending=[True, False]).reset_index(drop=True)
 
-export_df.insert(0, "overall_rank", np.arange(1, len(export_df) + 1))
+    export_df.insert(0, "overall_rank", np.arange(1, len(export_df) + 1))
 
-cols = [
-    "overall_rank",
-    "player_id",
-    "full_name",
-    "position",
-    "team",
-    "pos_rank",
-    "drafts",
-    "picks",
-    "adp",
-    "min_pick",
-    "max_pick",
-    "avg_price",
-    "med_price",
-    "min_price",
-    "max_price",
-    "ppg",
-    "games_played",
-    "fantasy_pts",
-    "rookie_year",
-    "years_exp",
-    "is_rookie_pick",
-]
-cols = [c for c in cols if c in export_df.columns]
-export_df = export_df[cols].copy()
+    cols = [
+        "overall_rank",
+        "player_id",
+        "full_name",
+        "position",
+        "team",
+        "pos_rank",
+        "drafts",
+        "picks",
+        "adp",
+        "min_pick",
+        "max_pick",
+        "avg_price",
+        "med_price",
+        "min_price",
+        "max_price",
+        "ppg",
+        "games_played",
+        "fantasy_pts",
+        "rookie_year",
+        "years_exp",
+        "is_rookie_pick",
+    ]
+    cols = [c for c in cols if c in export_df.columns]
+    export_df = export_df[cols].copy()
 
-csv_bytes = export_df.to_csv(index=False).encode("utf-8")
-safe_kind = (
-    board_kind.lower()
-    .replace(" ", "_")
-    .replace("(", "")
-    .replace(")", "")
-    .replace("/", "_")
-)
-
-with m4:
+    csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+    safe_kind = (
+        board_kind.lower()
+        .replace(" ", "_")
+        .replace("(", "")
+        .replace(")", "")
+        .replace("/", "_")
+    )
     st.download_button(
-        label="📥 Download CSV (current board)",
+        label="Download CSV (long-form list)",
         data=csv_bytes,
         file_name=f"sleeper_board_export_{safe_kind}_{int(season)}_{int(num_teams)}t_{int(num_rounds)}r.csv",
         mime="text/csv",
-        help="Exports the current board after all filters and rookie rules.",
     )
+    st.caption("Reflects all current filters and the selected board type.")
 
-del export_df
-gc.collect()
+    del export_df
+    gc.collect()
 
 # Render board
-st.divider()
 if mode == "auction":
     st.subheader("Auction Price Board")
     title_line = f"{board_kind} • Season {season} • {num_teams} teams × {num_rounds} rounds • ranked by Avg $"
@@ -1719,15 +1700,9 @@ if DEBUG:
     st.divider()
     st.markdown("### 🧪 DEBUG: Memory + timings")
 
-    rookie_mask_all = None
-    rookie_count_all = None
-    try:
-        if mode == "adp" and (("rookie_year" in pool_for_board.columns) or ("years_exp" in pool_for_board.columns)):
-            rookie_mask_all = _rookie_player_mask(pool_for_board, int(season))
-            rookie_count_all = int(rookie_mask_all.sum()) if len(rookie_mask_all) else None
-    except Exception:
-        rookie_mask_all = None
-        rookie_count_all = None
+    # helpful rookie sanity counts
+    rookie_mask_all = _rookie_player_mask(pool_for_board, int(season)) if (mode == "adp" and ("rookie_year" in pool_for_board.columns or "years_exp" in pool_for_board.columns)) else None
+    rookie_count_all = int(rookie_mask_all.sum()) if rookie_mask_all is not None and len(rookie_mask_all) else None
 
     st.write(
         {
@@ -1748,7 +1723,6 @@ if DEBUG:
             "rookie_count_in_pool_for_board": rookie_count_all,
             "build_time": _fmt_secs(build_t1 - build_t0),
             "LOAD_PPG": LOAD_PPG,
-            "current_nfl_season_year_anchor": current_nfl_season_year(),
         }
     )
     st.caption("If rss_mb is still huge, reduce date range and/or Min drafts per month.")
